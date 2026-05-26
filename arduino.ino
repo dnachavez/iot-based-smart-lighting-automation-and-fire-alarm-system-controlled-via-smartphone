@@ -70,6 +70,18 @@ const uint32_t HTTP_CLIENT_TIMEOUT_MS     = 2000;   // drop a slow/silent HTTP c
 //   * [TELEM] shows mq2 baseline > threshold after warm -> raise SMOKE_THRESHOLDS[i],
 //       or keep USE_SMOKE_BASELINE_THRESHOLD=true and tune SMOKE_DELTA_THRESHOLD,
 //       or raise SMOKE_STARTUP_IGNORE_MS to let the sensor warm up longer
+//
+// After running the BUZZER HARDWARE PROOF tests below, set these two
+// constants according to which test made the buzzer beep:
+//
+//   If BUZZER_FORCE_PIN_LOW_TEST beeps and BUZZER_FORCE_PIN_HIGH_TEST is silent:
+//       const int BUZZER_ACTIVE_LEVEL   = LOW;
+//       const int BUZZER_INACTIVE_LEVEL = HIGH;
+//   If BUZZER_FORCE_PIN_HIGH_TEST beeps and BUZZER_FORCE_PIN_LOW_TEST is silent:
+//       const int BUZZER_ACTIVE_LEVEL   = HIGH;
+//       const int BUZZER_INACTIVE_LEVEL = LOW;
+//   If BOTH beep, or FLOAT beeps -> wiring is wrong, no firmware constant
+//       will fix it. See decision tree in the test plan.
 const int           BUZZER_ACTIVE_LEVEL     = HIGH;
 const int           BUZZER_INACTIVE_LEVEL   = LOW;
 const bool          RELAY_ACTIVE_LOW        = true;  // most 8-ch relay boards energize when IN pulled LOW
@@ -94,6 +106,36 @@ const bool          BUZZER_FORCE_DISABLED        = false;
 const bool          BUZZER_DIAGNOSTIC_MODE       = false;
 const unsigned long BUZZER_DIAGNOSTIC_ON_MS      = 1000;
 const unsigned long BUZZER_DIAGNOSTIC_OFF_MS     = 3000;
+
+// =============================================================
+// BUZZER HARDWARE PROOF CONFIG
+// =============================================================
+// Use these tests to prove whether the physical buzzer is controlled
+// by D12 and whether the module is active HIGH or active LOW.
+// Set EXACTLY ONE to true, upload, observe the buzzer, then set all
+// back to false for normal operation. Proof mode overrides
+// COMMISSIONING_MODE, BUZZER_DIAGNOSTIC_MODE, sensors, WiFi, HTTP,
+// telemetry, and relays — only D12 is touched.
+//
+// Test result matrix:
+//   LOW beeps, HIGH silent          -> active-LOW buzzer module.
+//                                      Set BUZZER_ACTIVE_LEVEL=LOW,
+//                                      BUZZER_INACTIVE_LEVEL=HIGH.
+//   HIGH beeps, LOW silent          -> active-HIGH buzzer module.
+//                                      Set BUZZER_ACTIVE_LEVEL=HIGH,
+//                                      BUZZER_INACTIVE_LEVEL=LOW.
+//   LOW beeps AND HIGH beeps        -> buzzer wired directly to power,
+//                                      wired to the wrong pin, or a
+//                                      3-pin module powered without
+//                                      SIG actually used. Firmware
+//                                      cannot silence it.
+//   LOW silent AND HIGH silent      -> buzzer not connected, broken,
+//                                      or on a different pin entirely.
+//   FLOAT still beeps               -> buzzer is not controlled by D12.
+//                                      Check wiring/module type.
+const bool          BUZZER_FORCE_PIN_LOW_TEST    = false;
+const bool          BUZZER_FORCE_PIN_HIGH_TEST   = false;
+const bool          BUZZER_FLOAT_PIN_TEST        = false;
 
 // =============================================================
 // DEBUG / COMMISSIONING CONFIG
@@ -318,6 +360,8 @@ void     readSensors(uint32_t now);
 void     updateAlerts(uint32_t now);
 void     setLight(uint8_t roomIndex, bool on);
 void     setBuzzer(bool on, const char *reason);
+bool     buzzerProofActive(const char *&selectedTest);
+void     applyBuzzerProof(const char *selectedTest, bool firstCall);
 void     handleHttpClient();
 void     logTelemetry(uint32_t now);
 void     sendJsonStatus(WiFiClient &client);
@@ -337,6 +381,20 @@ void setup() {
 
   Serial.println();
   Serial.println(F("[BOOT] SmartLightFireAlarm starting"));
+
+  // BUZZER HARDWARE PROOF — when any BUZZER_*_TEST constant is true,
+  // bypass the rest of setup (relays, sensors, calibration, WiFi) and
+  // only drive D12. The loop will keep re-asserting the chosen state.
+  // This isolates "is the buzzer controlled by D12?" from every other
+  // subsystem on the board.
+  {
+    const char *proofMode = nullptr;
+    if (buzzerProofActive(proofMode)) {
+      applyBuzzerProof(proofMode, /*firstCall=*/true);
+      bootMs = millis();
+      return;
+    }
+  }
 
   // Token sanity check — warn loudly if it's missing, short, or still the placeholder.
   if (strcmp(SECRET_API_TOKEN, "change-me-to-a-long-random-string") == 0 ||
@@ -512,6 +570,32 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+
+  // BUZZER HARDWARE PROOF — runs before BUZZER_DIAGNOSTIC_MODE,
+  // sensors, WiFi, HTTP, telemetry. Re-asserts D12 every 500 ms (or
+  // prints a status heartbeat every 2 s for FLOAT). Returns early so
+  // nothing else touches the pin or the rest of the rig.
+  {
+    const char *proofMode = nullptr;
+    if (buzzerProofActive(proofMode)) {
+      static uint32_t lastProofMs = 0;
+      bool isFloat = (strcmp(proofMode, "FLOAT") == 0);
+      uint32_t interval = isFloat ? 2000 : 500;
+      if ((now - lastProofMs) >= interval) {
+        lastProofMs = now;
+        applyBuzzerProof(proofMode, /*firstCall=*/false);
+        if (isFloat) {
+          Serial.println(F("[BUZZER_PROOF] mode=FLOAT pinMode=INPUT (D12 high-Z)"));
+        } else {
+          Serial.print(F("[BUZZER_PROOF] mode="));
+          Serial.print(proofMode);
+          Serial.print(F(" pinLevel="));
+          Serial.println(lastBuzzerPinLevel == HIGH ? F("HIGH") : F("LOW"));
+        }
+      }
+      return;
+    }
+  }
 
   // Hardware-isolation mode: bypass every sensor / alert / WiFi / HTTP
   // path and just blink D12 in a known pattern. If the physical buzzer
@@ -943,6 +1027,57 @@ void setLight(uint8_t i, bool on) {
   digitalWrite(RELAY_PINS[i], pinHigh ? HIGH : LOW);
 }
 
+// Returns true if any BUZZER_*_TEST is enabled and assigns selectedTest
+// to one of "LOW" / "HIGH" / "FLOAT". If more than one is enabled,
+// prints an error and defaults to "LOW" so the safe inactive level is
+// asserted while the user fixes the source.
+bool buzzerProofActive(const char *&selectedTest) {
+  uint8_t enabled = (BUZZER_FORCE_PIN_LOW_TEST  ? 1 : 0)
+                  + (BUZZER_FORCE_PIN_HIGH_TEST ? 1 : 0)
+                  + (BUZZER_FLOAT_PIN_TEST      ? 1 : 0);
+  if (enabled == 0) { selectedTest = nullptr; return false; }
+  if (enabled > 1) {
+    Serial.println(F("[BUZZER_PROOF][ERR] more than one proof mode is true;"));
+    Serial.println(F("[BUZZER_PROOF][ERR] defaulting to FORCE_PIN_LOW."));
+    selectedTest = "LOW";
+    return true;
+  }
+  if (BUZZER_FORCE_PIN_LOW_TEST)  { selectedTest = "LOW";   return true; }
+  if (BUZZER_FORCE_PIN_HIGH_TEST) { selectedTest = "HIGH";  return true; }
+  selectedTest = "FLOAT";
+  return true;
+}
+
+// Latches D12 according to the active proof mode. firstCall=true prints
+// the one-time banner; subsequent calls re-assert silently. The pin is
+// re-driven every 500 ms from loop() so any spurious external pull is
+// visible against the known commanded state.
+void applyBuzzerProof(const char *selectedTest, bool firstCall) {
+  if (strcmp(selectedTest, "FLOAT") == 0) {
+    pinMode(BUZZER_PIN, INPUT);
+    if (firstCall) {
+      Serial.println(F("[BUZZER_PROOF] D12 set to INPUT/floating."));
+      Serial.println(F("[BUZZER_PROOF] If buzzer still beeps, wiring/module is not controlled correctly by D12."));
+    }
+  } else if (strcmp(selectedTest, "HIGH") == 0) {
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, HIGH);
+    lastBuzzerPinLevel = HIGH;
+    if (firstCall) {
+      Serial.println(F("[BUZZER_PROOF] D12 forced HIGH forever."));
+      Serial.println(F("[BUZZER_PROOF] If buzzer stops here but beeps when LOW, buzzer is active-low."));
+    }
+  } else {
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+    lastBuzzerPinLevel = LOW;
+    if (firstCall) {
+      Serial.println(F("[BUZZER_PROOF] D12 forced LOW forever."));
+      Serial.println(F("[BUZZER_PROOF] If buzzer beeps, it is active-low OR wired incorrectly."));
+    }
+  }
+}
+
 // Single source of truth for "is the buzzer on right now and why". The
 // `reason` argument is recorded into the global buzzerReason so /status and
 // telemetry never disagree with the actual pin state. Diagnostic mode owns
@@ -1063,6 +1198,16 @@ void logTelemetry(uint32_t now) {
     Serial.print(rooms[i].lightOn ? F("on") : F("off"));
     Serial.print(F(" lockout="));
     Serial.println(rooms[i].fireLockout ? F("YES") : F("no"));
+
+    if (FLAME_SENSOR_ENABLED[i] && rooms[i].flameRaw && raw == flameDetectedLevels[i]) {
+      Serial.print(F("[CAUSE] room="));
+      Serial.print(i + 1);
+      Serial.print(F(" flame would alert because raw="));
+      Serial.print(raw == HIGH ? F("H") : F("L"));
+      Serial.print(F(" equals detected="));
+      Serial.print(flameDetectedLevels[i] == HIGH ? F("H") : F("L"));
+      Serial.println(F(" (flip MANUAL_FLAME_DETECTED_LEVELS or disable this room to silence)"));
+    }
   }
 }
 
