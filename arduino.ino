@@ -8,7 +8,7 @@
     - 1 MQ-2 smoke sensor (analog) on A0..A4
     - 1 bulb on a relay channel  on D7..D11
   Plus:
-    - 1 active buzzer on D12 (active-HIGH)
+    - 1 active buzzer on D12 (level configurable via BUZZER_ACTIVE_LEVEL)
 
   Behavior:
     * Flame detected in room N -> immediately turn off relay N, sound buzzer,
@@ -58,17 +58,27 @@ const uint32_t WIFI_CONNECT_TIMEOUT_MS    = 10000;  // setup() gives up after th
 const uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;  // backoff between reconnect attempts
 const uint32_t HTTP_CLIENT_TIMEOUT_MS     = 2000;   // drop a slow/silent HTTP client after this
 
-// --- Hardware polarity (flip these if your modules behave oppositely)
-const bool RELAY_ACTIVE_LOW = true;   // most cheap 8-channel relay modules energize when IN pulled LOW
-const bool FLAME_ACTIVE_LOW = true;   // most flame modules pull D0 LOW when flame is detected
+// --- Hardware polarity (flip ONE constant if your modules behave oppositely)
+// Continuous-buzzer diagnosis playbook (read [TELEM] lines on Serial @ 115200):
+//   * Buzzer ON at boot with no alert state in Serial   -> swap BUZZER_ACTIVE_LEVEL/INACTIVE_LEVEL
+//   * Buzzer SILENT during a confirmed real alert       -> swap BUZZER_ACTIVE_LEVEL/INACTIVE_LEVEL
+//   * [TELEM] shows flame=YES with no actual flame      -> flip FLAME_DETECTED_LEVEL to HIGH
+//   * [TELEM] shows mq2 baseline > threshold after warm -> raise SMOKE_THRESHOLD or SMOKE_STARTUP_IGNORE_MS
+const int           BUZZER_ACTIVE_LEVEL     = HIGH;
+const int           BUZZER_INACTIVE_LEVEL   = LOW;
+const int           FLAME_DETECTED_LEVEL    = LOW;   // YL-38/KY-026 default: comparator pulls LOW on flame
+const bool          RELAY_ACTIVE_LOW        = true;  // most 8-ch relay boards energize when IN pulled LOW
 
 // --- Detection tuning
-const int      SMOKE_THRESHOLD       = 400;   // raw 0..1023; calibrate after warm-up
-const uint8_t  SMOKE_SAMPLES         = 8;     // rolling-average window for MQ-2
-const uint32_t FLAME_DEBOUNCE_MS     = 250;   // flame line must hold state this long
-const uint32_t NOTIFICATION_DELAY_MS = 3000;  // delay before firing one-shot notification
-const uint32_t SENSOR_WARMUP_MS      = 30000; // suppress smoke alerts during MQ-2 warm-up
-const bool     TURN_OFF_LIGHT_ON_SMOKE = false;
+// Raised from 400 -> 500: MQ-2 clean-air baseline frequently sits at 400-600
+// even after the warm-up window. If the buzzer still latches once warm=yes in
+// [TELEM], note the highest per-room mq2 value and raise this another ~100.
+const int           SMOKE_THRESHOLD         = 500;   // raw 0..1023
+const uint8_t       SMOKE_SAMPLES           = 8;     // rolling-average window for MQ-2
+const uint32_t      FLAME_DEBOUNCE_MS       = 250;   // flame line must hold state this long
+const uint32_t      NOTIFICATION_DELAY_MS   = 3000;  // delay before firing one-shot notification
+const unsigned long SMOKE_STARTUP_IGNORE_MS = 30000; // suppress smoke alerts during MQ-2 warm-up
+const bool          TURN_OFF_LIGHT_ON_SMOKE = false;
 
 // --- Pins (array index 0..4 == room 1..5)
 const uint8_t FLAME_PINS[5] = {2, 3, 4, 5, 6};
@@ -125,6 +135,7 @@ void     updateAlerts(uint32_t now);
 void     setLight(uint8_t roomIndex, bool on);
 void     setBuzzer(bool on);
 void     handleHttpClient();
+void     logTelemetry(uint32_t now);
 void     sendJsonStatus(WiFiClient &client);
 void     sendAlertNotification(uint8_t roomIndex, const char *reason);
 bool     resetAlertsIfSafe();
@@ -150,6 +161,22 @@ void setup() {
     Serial.println(F("[WARN] could dismiss fire alerts or flip relays. Edit arduino.ino."));
   }
 
+  // Print active configuration so the Serial Monitor shows which polarity flags
+  // and thresholds are in effect. If the buzzer is misbehaving, the user reads
+  // these alongside the [TELEM] lines below to decide which constant to flip.
+  Serial.print(F("[CFG] BUZZER_ACTIVE_LEVEL="));
+  Serial.println(BUZZER_ACTIVE_LEVEL == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("[CFG] BUZZER_INACTIVE_LEVEL="));
+  Serial.println(BUZZER_INACTIVE_LEVEL == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("[CFG] FLAME_DETECTED_LEVEL="));
+  Serial.println(FLAME_DETECTED_LEVEL == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("[CFG] SMOKE_THRESHOLD="));
+  Serial.println(SMOKE_THRESHOLD);
+  Serial.print(F("[CFG] SMOKE_STARTUP_IGNORE_MS="));
+  Serial.println(SMOKE_STARTUP_IGNORE_MS);
+  Serial.println(F("[CFG] MQ-2 smoke alerts are SUPPRESSED during the warm-up window above."));
+  Serial.println(F("[CFG] If buzzer is on at boot, read the [TELEM] lines and flip the wrong constant."));
+
   // Pin modes
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
     pinMode(FLAME_PINS[i], INPUT);
@@ -172,10 +199,12 @@ void setup() {
     rooms[i].smokeAlertSinceMs = 0;
     for (uint8_t s = 0; s < SMOKE_SAMPLES; s++) rooms[i].smokeBuf[s] = 0;
   }
-  // Same pre-load order for the buzzer (active-HIGH, so default LOW would already
-  // be safe — applying the pattern uniformly so the convention is consistent).
-  digitalWrite(BUZZER_PIN, LOW);
+  // Same pre-load order for the buzzer. Whichever level is INACTIVE for the
+  // user's module gets latched onto the output BEFORE we switch the pin to
+  // OUTPUT, so the buzzer can never beep during the boot transition.
+  digitalWrite(BUZZER_PIN, BUZZER_INACTIVE_LEVEL);
   pinMode(BUZZER_PIN, OUTPUT);
+  buzzerOn = false;
 
   // Try WiFi with a bounded wait. loop() will keep retrying if this fails.
   Serial.print(F("[WIFI] connecting to "));
@@ -211,6 +240,7 @@ void loop() {
   readSensors(now);
   updateAlerts(now);
   handleHttpClient();
+  logTelemetry(now);
 }
 
 // ============================================================
@@ -249,9 +279,11 @@ void maintainWifi(uint32_t now) {
 // ============================================================
 void readSensors(uint32_t now) {
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
-    // Flame (digital, polarity-normalized)
+    // Flame (digital, polarity-normalized). YL-38/KY-026 modules drive D0 with
+    // an LM393 push-pull comparator, so plain INPUT is correct — INPUT_PULLUP
+    // would fight the comparator's HIGH side.
     int raw = digitalRead(FLAME_PINS[i]);
-    bool active = FLAME_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH);
+    bool active = (raw == FLAME_DETECTED_LEVEL);
     if (active != rooms[i].flameRaw) {
       rooms[i].flameRaw          = active;
       rooms[i].flameLastChangeMs = now;
@@ -272,7 +304,7 @@ void readSensors(uint32_t now) {
 // ============================================================
 void updateAlerts(uint32_t now) {
   bool anyAlert = false;
-  bool warmedUp = (now - bootMs) >= SENSOR_WARMUP_MS;
+  bool warmedUp = (now - bootMs) >= SMOKE_STARTUP_IGNORE_MS;
 
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
     Room &r = rooms[i];
@@ -352,7 +384,51 @@ void setLight(uint8_t i, bool on) {
 void setBuzzer(bool on) {
   if (on == buzzerOn) return; // idempotent — avoid extra writes
   buzzerOn = on;
-  digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
+  digitalWrite(BUZZER_PIN, on ? BUZZER_ACTIVE_LEVEL : BUZZER_INACTIVE_LEVEL);
+}
+
+// ============================================================
+// Telemetry — periodic Serial dump for diagnosing the buzzer
+// ============================================================
+// Throttled to once every ~2 s. Prints one global summary line followed by one
+// line per room so the user can grep/scan and immediately see which room and
+// which sensor is driving the alert. This is the primary diagnostic tool for
+// the continuous-buzzer playbook documented at the top of the file.
+void logTelemetry(uint32_t now) {
+  static uint32_t lastLogMs = 0;
+  if ((now - lastLogMs) < 2000) return;
+  lastLogMs = now;
+
+  bool warmedUp = (now - bootMs) >= SMOKE_STARTUP_IGNORE_MS;
+  Serial.print(F("[TELEM] up="));
+  Serial.print((now - bootMs) / 1000);
+  Serial.print(F("s warm="));
+  Serial.print(warmedUp ? F("yes") : F("no"));
+  Serial.print(F(" wifi="));
+  Serial.print(WiFi.status() == WL_CONNECTED ? F("up") : F("down"));
+  Serial.print(F(" alert="));
+  Serial.print(globalAlert ? F("YES") : F("no"));
+  Serial.print(F(" buzzer="));
+  Serial.println(buzzerOn ? F("ON") : F("off"));
+
+  for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    Serial.print(F("[TELEM] room="));
+    Serial.print(i + 1);
+    Serial.print(F(" flameRaw="));
+    Serial.print(digitalRead(FLAME_PINS[i]) == HIGH ? F("H") : F("L"));
+    Serial.print(F(" flame="));
+    Serial.print(rooms[i].flameDetected ? F("YES") : F("no"));
+    Serial.print(F(" mq2="));
+    Serial.print(rooms[i].smokeAvg);
+    Serial.print(F("/"));
+    Serial.print(SMOKE_THRESHOLD);
+    Serial.print(F(" smoke="));
+    Serial.print(rooms[i].smokeAlert ? F("YES") : F("no"));
+    Serial.print(F(" light="));
+    Serial.print(rooms[i].lightOn ? F("on") : F("off"));
+    Serial.print(F(" lockout="));
+    Serial.println(rooms[i].fireLockout ? F("YES") : F("no"));
+  }
 }
 
 // ============================================================
@@ -534,8 +610,28 @@ void handleHttpClient() {
       if (resetAlertsIfSafe()) {
         sendResponse(httpClient, 200, "application/json", "{\"reset\":true}");
       } else {
-        sendResponse(httpClient, 409, "application/json",
-                     "{\"reset\":false,\"reason\":\"sensors still alerting\"}");
+        // Reset denied — surface exactly which rooms are still in danger so the
+        // mobile app can show the user where to look instead of a generic error.
+        String body = "{\"reset\":false,\"reason\":\"danger still active\",\"flameRooms\":[";
+        bool first = true;
+        for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+          if (rooms[i].flameDetected || rooms[i].flameRaw) {
+            if (!first) body += ",";
+            body += (i + 1);
+            first = false;
+          }
+        }
+        body += "],\"smokeRooms\":[";
+        first = true;
+        for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+          if (rooms[i].smokeAlert) {
+            if (!first) body += ",";
+            body += (i + 1);
+            first = false;
+          }
+        }
+        body += "]}";
+        sendResponse(httpClient, 409, "application/json", body);
       }
     } else {
       sendResponse(httpClient, 404, "application/json", "{\"error\":\"not found\"}");
