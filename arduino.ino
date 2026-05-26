@@ -62,12 +62,39 @@ const uint32_t HTTP_CLIENT_TIMEOUT_MS     = 2000;   // drop a slow/silent HTTP c
 // Continuous-buzzer diagnosis playbook (read [TELEM] lines on Serial @ 115200):
 //   * Buzzer ON at boot with no alert state in Serial   -> swap BUZZER_ACTIVE_LEVEL/INACTIVE_LEVEL
 //   * Buzzer SILENT during a confirmed real alert       -> swap BUZZER_ACTIVE_LEVEL/INACTIVE_LEVEL
-//   * [TELEM] shows flame=YES with no actual flame      -> flip FLAME_DETECTED_LEVEL to HIGH
+//   * [TELEM] shows flame=YES on a room with no flame   -> a per-room safe baseline is wrong;
+//       (1) confirm the [CAL] line for that room, (2) check wiring/pot for that pin,
+//       (3) if disconnected, set FLAME_SENSOR_ENABLED[i]=false temporarily,
+//       (4) or set AUTO_CALIBRATE_FLAME_SAFE_LEVEL=false and tune MANUAL_FLAME_DETECTED_LEVELS[i].
 //   * [TELEM] shows mq2 baseline > threshold after warm -> raise SMOKE_THRESHOLD or SMOKE_STARTUP_IGNORE_MS
 const int           BUZZER_ACTIVE_LEVEL     = HIGH;
 const int           BUZZER_INACTIVE_LEVEL   = LOW;
-const int           FLAME_DETECTED_LEVEL    = LOW;   // YL-38/KY-026 default: comparator pulls LOW on flame
 const bool          RELAY_ACTIVE_LOW        = true;  // most 8-ch relay boards energize when IN pulled LOW
+
+// --- Flame sensor interpretation (per-room, auto-calibrated)
+// Auto-calibration samples each flame pin during the first FLAME_CALIBRATION_MS
+// after boot and learns each room's safe (no-flame) baseline. Keep ALL flame
+// sensors away from flame during that window. After the window the "detected"
+// level is the opposite of the learned safe level. This handles mixed-polarity
+// modules and pins that idle LOW because they're disconnected/floating.
+//
+// Set AUTO_CALIBRATE_FLAME_SAFE_LEVEL=false to skip learning and use
+// MANUAL_FLAME_DETECTED_LEVELS[] verbatim — useful only if calibration is
+// unreliable for a given board.
+const bool          AUTO_CALIBRATE_FLAME_SAFE_LEVEL = true;
+const unsigned long FLAME_CALIBRATION_MS            = 5000;
+
+// Per-room enable. Set an entry to false ONLY for a sensor known to be
+// disconnected or faulty: it SUPPRESSES that room's fire alarm entirely.
+// This is a temporary debug aid — re-enable once wiring is fixed.
+// Length is hard-coded to 5 to match the rest of the per-room arrays; if you
+// change ROOM_COUNT, update the initializer list below as well.
+const bool          FLAME_SENSOR_ENABLED[5] = { true, true, true, true, true };
+
+// Used only when AUTO_CALIBRATE_FLAME_SAFE_LEVEL == false. Most YL-38/KY-026
+// modules pull D0 LOW on flame, so LOW matches the v1 default. Set HIGH for
+// any module whose D0 idles LOW. Length must match ROOM_COUNT (5).
+const int           MANUAL_FLAME_DETECTED_LEVELS[5] = { LOW, LOW, LOW, LOW, LOW };
 
 // --- Detection tuning
 // Raised from 400 -> 500: MQ-2 clean-air baseline frequently sits at 400-600
@@ -86,6 +113,14 @@ const uint8_t SMOKE_PINS[5] = {A0, A1, A2, A3, A4};
 const uint8_t RELAY_PINS[5] = {7, 8, 9, 10, 11};
 const uint8_t BUZZER_PIN    = 12;
 const uint8_t ROOM_COUNT    = 5;
+
+// Compile-time guard: if anyone bumps ROOM_COUNT, these asserts loudly remind
+// them to extend the per-room config arrays declared above.
+static_assert(sizeof(FLAME_PINS)                   / sizeof(FLAME_PINS[0])                   == ROOM_COUNT, "FLAME_PINS length must match ROOM_COUNT");
+static_assert(sizeof(SMOKE_PINS)                   / sizeof(SMOKE_PINS[0])                   == ROOM_COUNT, "SMOKE_PINS length must match ROOM_COUNT");
+static_assert(sizeof(RELAY_PINS)                   / sizeof(RELAY_PINS[0])                   == ROOM_COUNT, "RELAY_PINS length must match ROOM_COUNT");
+static_assert(sizeof(FLAME_SENSOR_ENABLED)         / sizeof(FLAME_SENSOR_ENABLED[0])         == ROOM_COUNT, "FLAME_SENSOR_ENABLED length must match ROOM_COUNT");
+static_assert(sizeof(MANUAL_FLAME_DETECTED_LEVELS) / sizeof(MANUAL_FLAME_DETECTED_LEVELS[0]) == ROOM_COUNT, "MANUAL_FLAME_DETECTED_LEVELS length must match ROOM_COUNT");
 
 // ============================================================
 // State
@@ -116,6 +151,20 @@ int8_t   lastAlertRoom   = -1;     // -1 = none, otherwise 0-based index
 uint32_t bootMs          = 0;
 uint32_t lastWifiAttempt = 0;
 bool     serverStarted   = false;
+
+// Flame calibration / interpretation runtime state. Populated in setup() and
+// finalized inside readSensors() once FLAME_CALIBRATION_MS has elapsed.
+int      flameSafeLevels[ROOM_COUNT]       = {0, 0, 0, 0, 0};
+int      flameDetectedLevels[ROOM_COUNT]   = {0, 0, 0, 0, 0};
+uint16_t flameHighCount[ROOM_COUNT]        = {0, 0, 0, 0, 0};
+uint16_t flameLowCount[ROOM_COUNT]         = {0, 0, 0, 0, 0};
+bool     flameCalibrationComplete          = false;
+uint32_t flameCalibrationStartedAt         = 0;
+bool     flameStuckWarningShown[ROOM_COUNT] = {false, false, false, false, false};
+
+// Why is the buzzer on right now? Surfaced in [TELEM] + /status so the user
+// can immediately see which subsystem is driving the alarm without digging.
+const char *buzzerReason = "off";   // "off" | "flame" | "smoke" | "flame+smoke"
 
 // HTTP request state — handleHttpClient() is non-blocking so the safety loop
 // (sensor reads + flame cut-off + buzzer) never waits on a slow or silent TCP
@@ -168,8 +217,22 @@ void setup() {
   Serial.println(BUZZER_ACTIVE_LEVEL == HIGH ? F("HIGH") : F("LOW"));
   Serial.print(F("[CFG] BUZZER_INACTIVE_LEVEL="));
   Serial.println(BUZZER_INACTIVE_LEVEL == HIGH ? F("HIGH") : F("LOW"));
-  Serial.print(F("[CFG] FLAME_DETECTED_LEVEL="));
-  Serial.println(FLAME_DETECTED_LEVEL == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("[CFG] AUTO_CALIBRATE_FLAME_SAFE_LEVEL="));
+  Serial.println(AUTO_CALIBRATE_FLAME_SAFE_LEVEL ? F("true") : F("false"));
+  Serial.print(F("[CFG] FLAME_CALIBRATION_MS="));
+  Serial.println(FLAME_CALIBRATION_MS);
+  Serial.print(F("[CFG] FLAME_SENSOR_ENABLED=["));
+  for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    if (i) Serial.print(',');
+    Serial.print(FLAME_SENSOR_ENABLED[i] ? '1' : '0');
+  }
+  Serial.println(']');
+  Serial.print(F("[CFG] MANUAL_FLAME_DETECTED_LEVELS=["));
+  for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    if (i) Serial.print(',');
+    Serial.print(MANUAL_FLAME_DETECTED_LEVELS[i] == HIGH ? 'H' : 'L');
+  }
+  Serial.println(']');
   Serial.print(F("[CFG] SMOKE_THRESHOLD="));
   Serial.println(SMOKE_THRESHOLD);
   Serial.print(F("[CFG] SMOKE_STARTUP_IGNORE_MS="));
@@ -180,6 +243,19 @@ void setup() {
   // Pin modes
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
     pinMode(FLAME_PINS[i], INPUT);
+
+    // Seed the flame interpretation tables. If auto-cal is enabled, these are
+    // provisional; readSensors() finalizes them after FLAME_CALIBRATION_MS.
+    // If auto-cal is disabled, MANUAL_FLAME_DETECTED_LEVELS[] is authoritative.
+    int seedRaw = digitalRead(FLAME_PINS[i]);
+    if (AUTO_CALIBRATE_FLAME_SAFE_LEVEL) {
+      flameSafeLevels[i]     = seedRaw;
+      flameDetectedLevels[i] = (seedRaw == HIGH) ? LOW : HIGH;
+    } else {
+      flameDetectedLevels[i] = MANUAL_FLAME_DETECTED_LEVELS[i];
+      flameSafeLevels[i]     = (MANUAL_FLAME_DETECTED_LEVELS[i] == HIGH) ? LOW : HIGH;
+    }
+
     // Pre-load the output latch to the relay's INACTIVE level BEFORE switching
     // the pin to OUTPUT. Otherwise the pin transitions through the default LOW
     // state, which momentarily energizes an active-LOW relay at boot.
@@ -199,6 +275,17 @@ void setup() {
     rooms[i].smokeAlertSinceMs = 0;
     for (uint8_t s = 0; s < SMOKE_SAMPLES; s++) rooms[i].smokeBuf[s] = 0;
   }
+
+  flameCalibrationComplete  = !AUTO_CALIBRATE_FLAME_SAFE_LEVEL; // skip window when manual
+  // NOTE: flameCalibrationStartedAt is set at the END of setup() so the 5 s
+  // window runs during loop() iterations (where samples are actually taken)
+  // rather than expiring during a blocking WiFi.begin() in setup().
+  if (AUTO_CALIBRATE_FLAME_SAFE_LEVEL) {
+    Serial.print(F("[CAL] Auto-calibrating flame safe levels for the first "));
+    Serial.print(FLAME_CALIBRATION_MS / 1000);
+    Serial.println(F(" s of operation."));
+    Serial.println(F("[CAL] Keep all flame sensors AWAY from flame during this window."));
+  }
   // Same pre-load order for the buzzer. Whichever level is INACTIVE for the
   // user's module gets latched onto the output BEFORE we switch the pin to
   // OUTPUT, so the buzzer can never beep during the boot transition.
@@ -207,6 +294,12 @@ void setup() {
   buzzerOn = false;
 
   // Try WiFi with a bounded wait. loop() will keep retrying if this fails.
+  if (strcmp(SECRET_SSID, "YOUR_WIFI_SSID") == 0 ||
+      strcmp(SECRET_PASS, "YOUR_WIFI_PASSWORD") == 0) {
+    Serial.println(F("[WARN] WiFi credentials are still placeholders — set"));
+    Serial.println(F("[WARN] SECRET_SSID/SECRET_PASS in arduino.ino. Continuing"));
+    Serial.println(F("[WARN] without network so the safety loop still runs."));
+  }
   Serial.print(F("[WIFI] connecting to "));
   Serial.println(SECRET_SSID);
   WiFi.begin(SECRET_SSID, SECRET_PASS);
@@ -230,8 +323,9 @@ void setup() {
     Serial.println(F("[WIFI] not connected — will retry from loop()"));
   }
 
-  lastWifiAttempt = millis();
-  bootMs          = millis();
+  lastWifiAttempt           = millis();
+  bootMs                    = millis();
+  flameCalibrationStartedAt = millis();
 }
 
 void loop() {
@@ -277,19 +371,45 @@ void maintainWifi(uint32_t now) {
 // ============================================================
 // Sensor sampling
 // ============================================================
+// Three-branch flame read per room:
+//   (1) disabled  -> force flameRaw false, keep smoke sampling
+//   (2) calibrating (auto-cal only) -> tally HIGH/LOW counts, do NOT detect
+//   (3) normal -> flameRaw = (digitalRead == flameDetectedLevels[i])
+// After every room is sampled, finalize the auto-cal window if it has just
+// elapsed. The existing debounce / lockout / alert machinery in updateAlerts()
+// runs unchanged downstream — it sees flameRaw=false during cal so no buzzer
+// can fire until a real, post-calibration flame event survives debounce.
 void readSensors(uint32_t now) {
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
     // Flame (digital, polarity-normalized). YL-38/KY-026 modules drive D0 with
     // an LM393 push-pull comparator, so plain INPUT is correct — INPUT_PULLUP
     // would fight the comparator's HIGH side.
     int raw = digitalRead(FLAME_PINS[i]);
-    bool active = (raw == FLAME_DETECTED_LEVEL);
-    if (active != rooms[i].flameRaw) {
-      rooms[i].flameRaw          = active;
-      rooms[i].flameLastChangeMs = now;
+
+    if (!FLAME_SENSOR_ENABLED[i]) {
+      // Disabled sensor: never trigger flame for this room. Smoke still works.
+      if (rooms[i].flameRaw) {
+        rooms[i].flameRaw          = false;
+        rooms[i].flameLastChangeMs = now;
+      }
+    } else if (AUTO_CALIBRATE_FLAME_SAFE_LEVEL && !flameCalibrationComplete) {
+      // Calibration window: tally samples per pin and hold flameRaw=false so
+      // debounce cannot promote any reading to flameDetected.
+      if (raw == HIGH) flameHighCount[i]++;
+      else             flameLowCount[i]++;
+      if (rooms[i].flameRaw) {
+        rooms[i].flameRaw          = false;
+        rooms[i].flameLastChangeMs = now;
+      }
+    } else {
+      bool active = (raw == flameDetectedLevels[i]);
+      if (active != rooms[i].flameRaw) {
+        rooms[i].flameRaw          = active;
+        rooms[i].flameLastChangeMs = now;
+      }
     }
 
-    // Smoke (analog, smoothed)
+    // Smoke (analog, smoothed) — unaffected by flame branch.
     uint16_t s = analogRead(SMOKE_PINS[i]);
     rooms[i].smokeBuf[rooms[i].smokeIdx] = s;
     rooms[i].smokeIdx = (rooms[i].smokeIdx + 1) % SMOKE_SAMPLES;
@@ -297,17 +417,72 @@ void readSensors(uint32_t now) {
     for (uint8_t k = 0; k < SMOKE_SAMPLES; k++) sum += rooms[i].smokeBuf[k];
     rooms[i].smokeAvg = sum / SMOKE_SAMPLES;
   }
+
+  // Finalize the calibration window once it has just elapsed. Majority vote
+  // picks the safe baseline; detected level is its opposite. After locking the
+  // result, re-read each pin once and warn loudly for any sensor that is
+  // already reading "detected" — that's the signature of a floating /
+  // miswired / over-sensitive module that would otherwise latch the buzzer.
+  if (AUTO_CALIBRATE_FLAME_SAFE_LEVEL && !flameCalibrationComplete &&
+      (now - flameCalibrationStartedAt) >= FLAME_CALIBRATION_MS) {
+    for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+      if (!FLAME_SENSOR_ENABLED[i]) {
+        Serial.print(F("[CAL] room="));
+        Serial.print(i + 1);
+        Serial.println(F(" SKIPPED (FLAME_SENSOR_ENABLED=false)"));
+        continue;
+      }
+      int safe = (flameHighCount[i] >= flameLowCount[i]) ? HIGH : LOW;
+      flameSafeLevels[i]     = safe;
+      flameDetectedLevels[i] = (safe == HIGH) ? LOW : HIGH;
+      Serial.print(F("[CAL] room="));
+      Serial.print(i + 1);
+      Serial.print(F(" safe="));
+      Serial.print(safe == HIGH ? F("H") : F("L"));
+      Serial.print(F(" detected="));
+      Serial.print(flameDetectedLevels[i] == HIGH ? F("H") : F("L"));
+      Serial.print(F(" highCount="));
+      Serial.print(flameHighCount[i]);
+      Serial.print(F(" lowCount="));
+      Serial.println(flameLowCount[i]);
+    }
+    flameCalibrationComplete = true;
+    Serial.println(F("[CAL] flame baseline learned"));
+
+    for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+      if (!FLAME_SENSOR_ENABLED[i]) continue;
+      int postRaw = digitalRead(FLAME_PINS[i]);
+      if (postRaw == flameDetectedLevels[i] && !flameStuckWarningShown[i]) {
+        Serial.print(F("[WARN] room="));
+        Serial.print(i + 1);
+        Serial.println(F(" flame pin reads DETECTED right after calibration."));
+        Serial.println(F("[WARN]  -> check wiring, potentiometer, or set"));
+        Serial.println(F("[WARN]     FLAME_SENSOR_ENABLED[i]=false temporarily."));
+        flameStuckWarningShown[i] = true;
+      }
+    }
+  }
 }
 
 // ============================================================
 // Alert state machine
 // ============================================================
 void updateAlerts(uint32_t now) {
-  bool anyAlert = false;
+  bool anyFlame = false;
+  bool anySmoke = false;
   bool warmedUp = (now - bootMs) >= SMOKE_STARTUP_IGNORE_MS;
 
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
     Room &r = rooms[i];
+
+    // Safety: a disabled flame sensor must never hold a lockout or pending
+    // notification. readSensors() already zeroes flameRaw; we clear the
+    // downstream state here so re-enabling at runtime is clean.
+    if (!FLAME_SENSOR_ENABLED[i]) {
+      r.fireLockout      = false;
+      r.notifiedFire     = false;
+      r.fireAlertSinceMs = 0;
+    }
 
     // --- Flame: debounce
     bool prev = r.flameDetected;
@@ -364,10 +539,16 @@ void updateAlerts(uint32_t now) {
       r.notifiedSmoke = true;
     }
 
-    if (r.flameDetected || r.smokeAlert) anyAlert = true;
+    if (r.flameDetected) anyFlame = true;
+    if (r.smokeAlert)    anySmoke = true;
   }
 
-  globalAlert = anyAlert;
+  bool anyAlert = anyFlame || anySmoke;
+  globalAlert   = anyAlert;
+  if      (anyFlame && anySmoke) buzzerReason = "flame+smoke";
+  else if (anyFlame)             buzzerReason = "flame";
+  else if (anySmoke)             buzzerReason = "smoke";
+  else                           buzzerReason = "off";
   setBuzzer(anyAlert);
 }
 
@@ -404,18 +585,31 @@ void logTelemetry(uint32_t now) {
   Serial.print((now - bootMs) / 1000);
   Serial.print(F("s warm="));
   Serial.print(warmedUp ? F("yes") : F("no"));
+  Serial.print(F(" calib="));
+  Serial.print(flameCalibrationComplete ? F("done") : F("learning"));
   Serial.print(F(" wifi="));
   Serial.print(WiFi.status() == WL_CONNECTED ? F("up") : F("down"));
   Serial.print(F(" alert="));
   Serial.print(globalAlert ? F("YES") : F("no"));
   Serial.print(F(" buzzer="));
-  Serial.println(buzzerOn ? F("ON") : F("off"));
+  Serial.print(buzzerOn ? F("ON") : F("off"));
+  Serial.print(F(" reason="));
+  Serial.println(buzzerReason);
 
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    int raw = digitalRead(FLAME_PINS[i]);
     Serial.print(F("[TELEM] room="));
     Serial.print(i + 1);
+    Serial.print(F(" raw="));
+    Serial.print(raw == HIGH ? F("H") : F("L"));
+    Serial.print(F(" safe="));
+    Serial.print(flameSafeLevels[i] == HIGH ? F("H") : F("L"));
+    Serial.print(F(" det="));
+    Serial.print(flameDetectedLevels[i] == HIGH ? F("H") : F("L"));
+    Serial.print(F(" en="));
+    Serial.print(FLAME_SENSOR_ENABLED[i] ? F("y") : F("n"));
     Serial.print(F(" flameRaw="));
-    Serial.print(digitalRead(FLAME_PINS[i]) == HIGH ? F("H") : F("L"));
+    Serial.print(rooms[i].flameRaw ? F("YES") : F("no"));
     Serial.print(F(" flame="));
     Serial.print(rooms[i].flameDetected ? F("YES") : F("no"));
     Serial.print(F(" mq2="));
@@ -608,25 +802,28 @@ void handleHttpClient() {
       }
     } else if (method == "POST" && path == "/reset-alert") {
       if (resetAlertsIfSafe()) {
-        sendResponse(httpClient, 200, "application/json", "{\"reset\":true}");
+        sendResponse(httpClient, 200, "application/json", "{\"ok\":true,\"reset\":true}");
       } else {
         // Reset denied — surface exactly which rooms are still in danger so the
         // mobile app can show the user where to look instead of a generic error.
-        String body = "{\"reset\":false,\"reason\":\"danger still active\",\"flameRooms\":[";
+        // Disabled flame sensors cannot block reset (readSensors() forces their
+        // flameRaw/flameDetected to false anyway — this is belt-and-braces).
+        String body = "{\"ok\":false,\"message\":\"Cannot reset while danger is active\",\"blockingRooms\":[";
         bool first = true;
         for (uint8_t i = 0; i < ROOM_COUNT; i++) {
-          if (rooms[i].flameDetected || rooms[i].flameRaw) {
+          if (FLAME_SENSOR_ENABLED[i] &&
+              (rooms[i].flameDetected || rooms[i].flameRaw)) {
             if (!first) body += ",";
+            body += "{\"room\":";
             body += (i + 1);
+            body += ",\"reason\":\"flame\"}";
             first = false;
           }
-        }
-        body += "],\"smokeRooms\":[";
-        first = true;
-        for (uint8_t i = 0; i < ROOM_COUNT; i++) {
           if (rooms[i].smokeAlert) {
             if (!first) body += ",";
+            body += "{\"room\":";
             body += (i + 1);
+            body += ",\"reason\":\"smoke\"}";
             first = false;
           }
         }
@@ -644,7 +841,7 @@ void handleHttpClient() {
 
 void sendJsonStatus(WiFiClient &client) {
   String body;
-  body.reserve(640);
+  body.reserve(960);
   body += "{\"wifi\":{\"connected\":";
   body += (WiFi.status() == WL_CONNECTED ? "true" : "false");
   body += ",\"ip\":\"";
@@ -656,8 +853,12 @@ void sendJsonStatus(WiFiClient &client) {
   body += (uint32_t)(millis() - bootMs);
   body += ",\"buzzer\":";
   body += (buzzerOn ? "true" : "false");
-  body += ",\"alertActive\":";
+  body += ",\"buzzerReason\":\"";
+  body += buzzerReason;
+  body += "\",\"alertActive\":";
   body += (globalAlert ? "true" : "false");
+  body += ",\"flameCalibrationComplete\":";
+  body += (flameCalibrationComplete ? "true" : "false");
   body += ",\"lastAlertRoom\":";
   // null when no alert has fired since boot/reset — UIs render this as "none"
   // instead of a misleading "Room 0".
@@ -666,18 +867,27 @@ void sendJsonStatus(WiFiClient &client) {
   body += ",\"rooms\":[";
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
     if (i > 0) body += ",";
+    int raw = digitalRead(FLAME_PINS[i]);
     body += "{\"room\":";
     body += (i + 1);
-    body += ",\"light\":";
+    body += ",\"lightOn\":";
     body += (rooms[i].lightOn ? "true" : "false");
-    body += ",\"flame\":";
+    body += ",\"flameRaw\":\"";
+    body += (raw == HIGH ? 'H' : 'L');
+    body += "\",\"flameDetected\":";
     body += (rooms[i].flameDetected ? "true" : "false");
-    body += ",\"smoke\":";
-    body += rooms[i].smokeAvg;
-    body += ",\"smokeAlert\":";
-    body += (rooms[i].smokeAlert ? "true" : "false");
-    body += ",\"lockout\":";
+    body += ",\"flameSensorEnabled\":";
+    body += (FLAME_SENSOR_ENABLED[i] ? "true" : "false");
+    body += ",\"flameSafeLevel\":\"";
+    body += (flameSafeLevels[i] == HIGH ? 'H' : 'L');
+    body += "\",\"flameDetectedLevel\":\"";
+    body += (flameDetectedLevels[i] == HIGH ? 'H' : 'L');
+    body += "\",\"fireLockout\":";
     body += (rooms[i].fireLockout ? "true" : "false");
+    body += ",\"smokeValue\":";
+    body += rooms[i].smokeAvg;
+    body += ",\"smokeDetected\":";
+    body += (rooms[i].smokeAlert ? "true" : "false");
     body += "}";
   }
   body += "]}";
