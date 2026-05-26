@@ -1,5 +1,5 @@
 /*
-  SmartLightFireAlarm.ino
+  arduino.ino
   IoT-Based Smart Lighting Automation and Fire Alarm System
   Target board: Arduino Uno R4 WiFi (Renesas RA4M1 + ESP32-S3 radio via WiFiS3)
 
@@ -35,11 +35,18 @@
 */
 
 #include <WiFiS3.h>
-#include "arduino_secrets.h"
 
-#ifndef SECRET_API_TOKEN
-#error "SECRET_API_TOKEN not defined. Copy arduino_secrets.h.example to arduino_secrets.h, set a strong token, and re-compile."
-#endif
+// ============================================================
+// Credentials — edit these before flashing
+// ============================================================
+// To generate a strong API token: `openssl rand -hex 32`
+#define SECRET_SSID      "YOUR_WIFI_SSID"
+#define SECRET_PASS      "YOUR_WIFI_PASSWORD"
+
+// Shared secret required by every state-changing POST endpoint.
+// Anyone with this token can toggle relays and dismiss fire alerts on
+// the LAN. Keep it long and random.
+#define SECRET_API_TOKEN "change-me-to-a-long-random-string"
 
 // ============================================================
 // Configuration — tune these for your hardware and network
@@ -140,7 +147,7 @@ void setup() {
   if (strcmp(SECRET_API_TOKEN, "change-me-to-a-long-random-string") == 0 ||
       strlen(SECRET_API_TOKEN) < 16) {
     Serial.println(F("[WARN] SECRET_API_TOKEN is missing/short/default — anyone on the LAN"));
-    Serial.println(F("[WARN] could dismiss fire alerts or flip relays. Edit arduino_secrets.h."));
+    Serial.println(F("[WARN] could dismiss fire alerts or flip relays. Edit arduino.ino."));
   }
 
   // Pin modes
