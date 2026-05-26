@@ -71,6 +71,35 @@ const int           BUZZER_ACTIVE_LEVEL     = HIGH;
 const int           BUZZER_INACTIVE_LEVEL   = LOW;
 const bool          RELAY_ACTIVE_LOW        = true;  // most 8-ch relay boards energize when IN pulled LOW
 
+// --- Buzzer hardware diagnostics (set to 'true' temporarily to isolate
+// firmware-vs-wiring problems; ALWAYS reset to 'false' before regular use).
+//
+// BUZZER_FORCE_DISABLED:
+//   When true, every setBuzzer(true) is rewritten to write the inactive
+//   level. Use this to PROVE the buzzer is no longer being driven by
+//   firmware. If it still beeps with this flag on, the buzzer is not
+//   actually controlled by D12 (wrong pin or wired directly to 5V/GND).
+//
+// BUZZER_DIAGNOSTIC_MODE:
+//   When true, all sensor reads, alert evaluation, WiFi maintenance, and
+//   HTTP serving are skipped. The loop only blinks D12 between INACTIVE
+//   and ACTIVE on a 1 s ON / 3 s OFF cadence. Use this to PROVE D12
+//   actually controls the buzzer. If the buzzer does not follow the
+//   blink, the buzzer is wired wrong (different pin, no signal
+//   connection, or directly across rails).
+const bool          BUZZER_FORCE_DISABLED        = false;
+const bool          BUZZER_DIAGNOSTIC_MODE       = false;
+const unsigned long BUZZER_DIAGNOSTIC_ON_MS      = 1000;
+const unsigned long BUZZER_DIAGNOSTIC_OFF_MS     = 3000;
+
+// Optional stronger anti-flicker for noisy flame sensors. After the
+// FLAME_DEBOUNCE_MS window, additionally require this many consecutive
+// matching reads before promoting flameRaw -> flameDetected. 1 = behavior
+// before this constant existed (no extra confirmation). 3 = require three
+// back-to-back agreements; real fires hold for many seconds so the only
+// thing this filters out is single noisy edges from a marginal sensor.
+const uint8_t       FLAME_CONFIRMATION_SAMPLES   = 3;
+
 // --- Flame sensor interpretation (per-room, auto-calibrated)
 // Auto-calibration samples each flame pin during the first FLAME_CALIBRATION_MS
 // after boot and learns each room's safe (no-flame) baseline. Keep ALL flame
@@ -152,6 +181,30 @@ uint32_t bootMs          = 0;
 uint32_t lastWifiAttempt = 0;
 bool     serverStarted   = false;
 
+// Last level actually written to D12 (HIGH or LOW). Updated only when
+// digitalWrite() is invoked. Reported in [TELEM] so a firmware-vs-wiring
+// mismatch is visible from Serial alone — if `buzzerCmd=OFF` but
+// `buzzerPinWrite=HIGH`, the alert path and the GPIO state disagree.
+int      lastBuzzerPinLevel = BUZZER_INACTIVE_LEVEL;
+
+// Per-room stuck / noise tracking for the flame inputs. Populated in
+// readSensors() after calibration completes. The warnings each fire at
+// most once per boot so the Serial log stays grep-friendly.
+uint32_t flameLastEdgeMs[ROOM_COUNT]          = {0, 0, 0, 0, 0};
+uint16_t flameEdgesInWindow[ROOM_COUNT]       = {0, 0, 0, 0, 0};
+uint32_t flameNoiseWindowStart[ROOM_COUNT]    = {0, 0, 0, 0, 0};
+uint8_t  flameConfirmStreak[ROOM_COUNT]       = {0, 0, 0, 0, 0};
+bool     flameNoisyWarned[ROOM_COUNT]         = {false, false, false, false, false};
+bool     flameStuckPostCalWarned[ROOM_COUNT]  = {false, false, false, false, false};
+uint32_t flameDetectedSinceMs[ROOM_COUNT]     = {0, 0, 0, 0, 0};
+
+// Cached raw level captured once in readSensors() and reused in
+// logTelemetry() + sendJsonStatus() so all three reporters agree on the
+// same physical sample within one loop iteration. Without this cache,
+// rapid sensor noise can make telemetry `raw=` disagree with the
+// `flameRaw=` / `flame=` values from the same loop iteration.
+int      flameRawLevel[ROOM_COUNT]            = {0, 0, 0, 0, 0};
+
 // Flame calibration / interpretation runtime state. Populated in setup() and
 // finalized inside readSensors() once FLAME_CALIBRATION_MS has elapsed.
 int      flameSafeLevels[ROOM_COUNT]       = {0, 0, 0, 0, 0};
@@ -217,6 +270,12 @@ void setup() {
   Serial.println(BUZZER_ACTIVE_LEVEL == HIGH ? F("HIGH") : F("LOW"));
   Serial.print(F("[CFG] BUZZER_INACTIVE_LEVEL="));
   Serial.println(BUZZER_INACTIVE_LEVEL == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("[CFG] BUZZER_FORCE_DISABLED="));
+  Serial.println(BUZZER_FORCE_DISABLED ? F("YES (alerts suppressed)") : F("no"));
+  Serial.print(F("[CFG] BUZZER_DIAGNOSTIC_MODE="));
+  Serial.println(BUZZER_DIAGNOSTIC_MODE ? F("YES (D12 blink pattern only)") : F("no"));
+  Serial.print(F("[CFG] FLAME_CONFIRMATION_SAMPLES="));
+  Serial.println(FLAME_CONFIRMATION_SAMPLES);
   Serial.print(F("[CFG] AUTO_CALIBRATE_FLAME_SAFE_LEVEL="));
   Serial.println(AUTO_CALIBRATE_FLAME_SAFE_LEVEL ? F("true") : F("false"));
   Serial.print(F("[CFG] FLAME_CALIBRATION_MS="));
@@ -292,6 +351,7 @@ void setup() {
   digitalWrite(BUZZER_PIN, BUZZER_INACTIVE_LEVEL);
   pinMode(BUZZER_PIN, OUTPUT);
   buzzerOn = false;
+  lastBuzzerPinLevel = BUZZER_INACTIVE_LEVEL;
 
   // Try WiFi with a bounded wait. loop() will keep retrying if this fails.
   if (strcmp(SECRET_SSID, "YOUR_WIFI_SSID") == 0 ||
@@ -330,6 +390,34 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+
+  // Hardware-isolation mode: bypass every sensor / alert / WiFi / HTTP
+  // path and just blink D12 in a known pattern. If the physical buzzer
+  // does not follow this pattern, the buzzer is wired wrong (different
+  // pin, no signal connection, or directly across 5V/GND). See the
+  // [CFG] BUZZER_DIAGNOSTIC_MODE notes at the top of the file.
+  if (BUZZER_DIAGNOSTIC_MODE) {
+    static uint32_t diagPhaseStart = 0;
+    static bool     diagOn         = false;
+    if (diagPhaseStart == 0) {
+      diagPhaseStart = now;
+      digitalWrite(BUZZER_PIN, BUZZER_INACTIVE_LEVEL);
+      lastBuzzerPinLevel = BUZZER_INACTIVE_LEVEL;
+      Serial.println(F("[BUZZER_TEST] D12=INACTIVE"));
+    }
+    unsigned long phaseMs = diagOn ? BUZZER_DIAGNOSTIC_ON_MS : BUZZER_DIAGNOSTIC_OFF_MS;
+    if ((now - diagPhaseStart) >= phaseMs) {
+      diagOn = !diagOn;
+      diagPhaseStart = now;
+      int level = diagOn ? BUZZER_ACTIVE_LEVEL : BUZZER_INACTIVE_LEVEL;
+      digitalWrite(BUZZER_PIN, level);
+      lastBuzzerPinLevel = level;
+      Serial.println(diagOn ? F("[BUZZER_TEST] D12=ACTIVE")
+                            : F("[BUZZER_TEST] D12=INACTIVE"));
+    }
+    return; // skip WiFi maintenance, sensors, alerts, HTTP, telemetry
+  }
+
   maintainWifi(now);
   readSensors(now);
   updateAlerts(now);
@@ -385,6 +473,7 @@ void readSensors(uint32_t now) {
     // an LM393 push-pull comparator, so plain INPUT is correct — INPUT_PULLUP
     // would fight the comparator's HIGH side.
     int raw = digitalRead(FLAME_PINS[i]);
+    flameRawLevel[i] = raw; // cached for logTelemetry() + sendJsonStatus()
 
     if (!FLAME_SENSOR_ENABLED[i]) {
       // Disabled sensor: never trigger flame for this room. Smoke still works.
@@ -416,6 +505,45 @@ void readSensors(uint32_t now) {
     uint32_t sum = 0;
     for (uint8_t k = 0; k < SMOKE_SAMPLES; k++) sum += rooms[i].smokeBuf[k];
     rooms[i].smokeAvg = sum / SMOKE_SAMPLES;
+
+    // Edge-rate + stuck-pin diagnostics for the flame inputs (post-cal only).
+    // A genuinely toggling input (potentiometer near threshold, floating wire,
+    // bad ground) shows up as many transitions per 5-second window even when
+    // there is no fire. A genuinely stuck input sits at the detected level
+    // without the alert ever confirming — that's a wiring/pot problem, not a
+    // fire. Both warnings fire at most once per boot so the log stays clean.
+    if (FLAME_SENSOR_ENABLED[i] && flameCalibrationComplete) {
+      static int prevFlameSample[ROOM_COUNT] = {0, 0, 0, 0, 0};
+      if (raw != prevFlameSample[i]) {
+        flameEdgesInWindow[i]++;
+        flameLastEdgeMs[i] = now;
+        prevFlameSample[i] = raw;
+      }
+      if ((now - flameNoiseWindowStart[i]) >= 5000) {
+        if (flameEdgesInWindow[i] > 20 && !flameNoisyWarned[i]) {
+          Serial.print(F("[WARN] room="));
+          Serial.print(i + 1);
+          Serial.print(F(" flame input is noisy (edges="));
+          Serial.print(flameEdgesInWindow[i]);
+          Serial.println(F(" in 5s); check potentiometer / common ground / wiring"));
+          flameNoisyWarned[i] = true;
+        }
+        flameNoiseWindowStart[i] = now;
+        flameEdgesInWindow[i]    = 0;
+      }
+      if (raw == flameDetectedLevels[i]) {
+        if (flameDetectedSinceMs[i] == 0) flameDetectedSinceMs[i] = now;
+        if (!flameStuckPostCalWarned[i] && !rooms[i].flameDetected &&
+            (now - flameDetectedSinceMs[i]) >= 10000) {
+          Serial.print(F("[WARN] room="));
+          Serial.print(i + 1);
+          Serial.println(F(" flame input stuck at detected level (>10s) without confirming a fire"));
+          flameStuckPostCalWarned[i] = true;
+        }
+      } else {
+        flameDetectedSinceMs[i] = 0;
+      }
+    }
   }
 
   // Finalize the calibration window once it has just elapsed. Majority vote
@@ -449,9 +577,21 @@ void readSensors(uint32_t now) {
     flameCalibrationComplete = true;
     Serial.println(F("[CAL] flame baseline learned"));
 
+    // Fresh debounce arming so the first post-cal read cannot satisfy a stale
+    // 250 ms window. Without this, flameLastChangeMs was 0 (well past the
+    // debounce threshold), and a single matching post-cal sample on a noisy
+    // pin could promote straight to flameDetected and latch the buzzer.
     for (uint8_t i = 0; i < ROOM_COUNT; i++) {
       if (!FLAME_SENSOR_ENABLED[i]) continue;
+      rooms[i].flameRaw          = false;
+      rooms[i].flameLastChangeMs = now;
+      flameConfirmStreak[i]      = 0;
+      flameNoiseWindowStart[i]   = now;
+      flameEdgesInWindow[i]      = 0;
+      flameDetectedSinceMs[i]    = 0;
+
       int postRaw = digitalRead(FLAME_PINS[i]);
+      flameRawLevel[i] = postRaw;
       if (postRaw == flameDetectedLevels[i] && !flameStuckWarningShown[i]) {
         Serial.print(F("[WARN] room="));
         Serial.print(i + 1);
@@ -484,10 +624,24 @@ void updateAlerts(uint32_t now) {
       r.fireAlertSinceMs = 0;
     }
 
-    // --- Flame: debounce
+    // --- Flame: debounce + N-of-N confirmation.
+    // Stage 1: the raw line must hold the new state for FLAME_DEBOUNCE_MS.
+    // Stage 2: after the time threshold is satisfied, additionally require
+    // FLAME_CONFIRMATION_SAMPLES consecutive loop iterations that still agree
+    // before promoting to flameDetected. With samples=3 a single noisy
+    // 250 ms blip can no longer latch lockout; real fires hold for many
+    // seconds so they confirm immediately.
     bool prev = r.flameDetected;
-    if (r.flameRaw != r.flameDetected && (now - r.flameLastChangeMs) >= FLAME_DEBOUNCE_MS) {
-      r.flameDetected = r.flameRaw;
+    if (r.flameRaw != r.flameDetected) {
+      if ((now - r.flameLastChangeMs) >= FLAME_DEBOUNCE_MS) {
+        flameConfirmStreak[i]++;
+        if (flameConfirmStreak[i] >= FLAME_CONFIRMATION_SAMPLES) {
+          r.flameDetected = r.flameRaw;
+          flameConfirmStreak[i] = 0;
+        }
+      }
+    } else {
+      flameConfirmStreak[i] = 0;
     }
 
     // Rising edge: fire just confirmed -> immediate cut-off + lockout
@@ -523,15 +677,26 @@ void updateAlerts(uint32_t now) {
       lastAlertRoom       = i;
       Serial.print(F("[SMOKE] room="));
       Serial.print(i + 1);
-      Serial.print(F(" value="));
-      Serial.println(r.smokeAvg);
+      Serial.print(F(" raw="));
+      Serial.print(r.smokeAvg);
+      Serial.print(F(" threshold="));
+      Serial.print(SMOKE_THRESHOLD);
+      Serial.print(F(" warmup="));
+      Serial.print(warmedUp ? F("no") : F("yes"));
+      Serial.println(F(" alert=YES"));
       if (TURN_OFF_LIGHT_ON_SMOKE) setLight(i, false);
     } else if (!smokeOver && r.smokeAlert) {
       r.smokeAlert    = false;
       r.notifiedSmoke = false; // allow re-notify on next crossing
       Serial.print(F("[SMOKE] room="));
       Serial.print(i + 1);
-      Serial.println(F(" cleared"));
+      Serial.print(F(" raw="));
+      Serial.print(r.smokeAvg);
+      Serial.print(F(" threshold="));
+      Serial.print(SMOKE_THRESHOLD);
+      Serial.print(F(" warmup="));
+      Serial.print(warmedUp ? F("no") : F("yes"));
+      Serial.println(F(" alert=no"));
     }
     if (r.smokeAlert && !r.notifiedSmoke &&
         (now - r.smokeAlertSinceMs) >= NOTIFICATION_DELAY_MS) {
@@ -563,9 +728,26 @@ void setLight(uint8_t i, bool on) {
 }
 
 void setBuzzer(bool on) {
+  // BUZZER_FORCE_DISABLED short-circuits every active write while still
+  // logging once on the falling edge from a previously-active state, so the
+  // Serial Monitor shows that the alert path TRIED to fire and was
+  // suppressed. The pin is held at INACTIVE.
+  if (on && BUZZER_FORCE_DISABLED) {
+    if (buzzerOn) {
+      Serial.println(F("[BUZZER] force-disabled is ON; alert path suppressed"));
+    }
+    buzzerOn = false;
+    if (lastBuzzerPinLevel != BUZZER_INACTIVE_LEVEL) {
+      digitalWrite(BUZZER_PIN, BUZZER_INACTIVE_LEVEL);
+      lastBuzzerPinLevel = BUZZER_INACTIVE_LEVEL;
+    }
+    return;
+  }
   if (on == buzzerOn) return; // idempotent — avoid extra writes
   buzzerOn = on;
-  digitalWrite(BUZZER_PIN, on ? BUZZER_ACTIVE_LEVEL : BUZZER_INACTIVE_LEVEL);
+  int level = on ? BUZZER_ACTIVE_LEVEL : BUZZER_INACTIVE_LEVEL;
+  digitalWrite(BUZZER_PIN, level);
+  lastBuzzerPinLevel = level;
 }
 
 // ============================================================
@@ -591,13 +773,22 @@ void logTelemetry(uint32_t now) {
   Serial.print(WiFi.status() == WL_CONNECTED ? F("up") : F("down"));
   Serial.print(F(" alert="));
   Serial.print(globalAlert ? F("YES") : F("no"));
+  Serial.print(F(" buzzerCmd="));
+  Serial.print(buzzerOn ? F("ON") : F("OFF"));
+  Serial.print(F(" buzzerPinWrite="));
+  Serial.print(lastBuzzerPinLevel == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F(" buzzerForceDisabled="));
+  Serial.print(BUZZER_FORCE_DISABLED ? F("Y") : F("N"));
   Serial.print(F(" buzzer="));
   Serial.print(buzzerOn ? F("ON") : F("off"));
   Serial.print(F(" reason="));
   Serial.println(buzzerReason);
 
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
-    int raw = digitalRead(FLAME_PINS[i]);
+    // Use the cached read from readSensors() so this telemetry line cannot
+    // disagree with the flameRaw= / flame= fields below: all three reporters
+    // see the same physical sample within one loop iteration.
+    int raw = flameRawLevel[i];
     Serial.print(F("[TELEM] room="));
     Serial.print(i + 1);
     Serial.print(F(" raw="));
@@ -830,6 +1021,33 @@ void handleHttpClient() {
         body += "]}";
         sendResponse(httpClient, 409, "application/json", body);
       }
+    } else if (method == "GET" && path == "/debug/buzzer") {
+      // Benchtop diagnostic: directly drive D12 via setBuzzer() without going
+      // through the alert state machine. Lets the user test from a phone or
+      // browser whether the firmware can actually silence or sound the
+      // buzzer. Response surfaces the actual GPIO level written so a polarity
+      // mismatch (buzzer module is active-LOW but BUZZER_ACTIVE_LEVEL=HIGH)
+      // is visible without a logic probe. GET is intentionally not token-
+      // gated, matching /health and /status. LAN-only prototype.
+      String want = queryParam(query, "state");
+      bool requestOn = (want == "on" || want == "1" || want == "true");
+      setBuzzer(requestOn);
+      String body;
+      body.reserve(192);
+      body += "{\"ok\":true,\"requested\":\"";
+      body += (requestOn ? "on" : "off");
+      body += "\",\"pin\":";
+      body += BUZZER_PIN;
+      body += ",\"writtenLevel\":\"";
+      body += (lastBuzzerPinLevel == HIGH ? "HIGH" : "LOW");
+      body += "\",\"buzzerCmd\":";
+      body += (buzzerOn ? "true" : "false");
+      body += ",\"forceDisabled\":";
+      body += (BUZZER_FORCE_DISABLED ? "true" : "false");
+      body += ",\"activeLevel\":\"";
+      body += (BUZZER_ACTIVE_LEVEL == HIGH ? "HIGH" : "LOW");
+      body += "\"}";
+      sendResponse(httpClient, 200, "application/json", body);
     } else {
       sendResponse(httpClient, 404, "application/json", "{\"error\":\"not found\"}");
     }
@@ -867,7 +1085,9 @@ void sendJsonStatus(WiFiClient &client) {
   body += ",\"rooms\":[";
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
     if (i > 0) body += ",";
-    int raw = digitalRead(FLAME_PINS[i]);
+    // Reuse the cached read from readSensors() so the HTTP /status response
+    // matches the same physical sample the [TELEM] line is showing.
+    int raw = flameRawLevel[i];
     body += "{\"room\":";
     body += (i + 1);
     body += ",\"lightOn\":";
