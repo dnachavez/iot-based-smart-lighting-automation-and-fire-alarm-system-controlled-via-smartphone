@@ -1,4 +1,0 @@
-# Never commit the populated secrets file — it contains the WiFi password
-# and the API token. Copy arduino_secrets.h.example to arduino_secrets.h and
-# fill in real values locally.
-arduino_secrets.h
