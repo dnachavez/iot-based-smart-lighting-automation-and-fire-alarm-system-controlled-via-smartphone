@@ -11,13 +11,13 @@
     - 1 active buzzer on D12 (level configurable via BUZZER_ACTIVE_LEVEL)
 
   Behavior:
-    * Flame detected in room N -> immediately turn off relay N, sound buzzer,
-      set fire lockout for that room, fire a one-shot notification after
-      NOTIFICATION_DELAY_MS so transient triggers don't spam the backend.
-    * Smoke (smoothed analog reading > SMOKE_THRESHOLDS[i] or baseline+delta)
-      -> sound buzzer,
-      mark smoke alert, fire a one-shot notification per event.
-      Light stays on unless TURN_OFF_LIGHT_ON_SMOKE = true.
+    * Flame OR smoke detected in any room -> cut every light, latch every
+      room's fireLockout, sound the buzzer, fire a one-shot notification
+      after NOTIFICATION_DELAY_MS. Smoke and fire share the same safety
+      path (see tripAllLightsForHazard()).
+    * The buzzer auto-silences after BUZZER_ALARM_MS (default 2 min) even
+      if the hazard persists. Lights stay OFF (lockout) until /reset-alert.
+      Hazard clears then returns -> buzzer re-arms and sounds again.
     * The mobile app (future React Native) calls a small local JSON HTTP API
       to read status, toggle lights, and acknowledge alerts.
     * /reset-alert only clears state if every sensor currently reads safe.
@@ -59,31 +59,38 @@ const uint32_t WIFI_CONNECT_TIMEOUT_MS    = 10000;  // setup() gives up after th
 const uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;  // backoff between reconnect attempts
 const uint32_t HTTP_CLIENT_TIMEOUT_MS     = 2000;   // drop a slow/silent HTTP client after this
 
-// --- Hardware polarity (flip ONE constant if your modules behave oppositely)
-// Continuous-buzzer diagnosis playbook (read [TELEM] lines on Serial @ 115200):
-//   * Buzzer ON at boot with no alert state in Serial   -> swap BUZZER_ACTIVE_LEVEL/INACTIVE_LEVEL
-//   * Buzzer SILENT during a confirmed real alert       -> swap BUZZER_ACTIVE_LEVEL/INACTIVE_LEVEL
-//   * [TELEM] shows flame=YES on a room with no flame   -> a per-room safe baseline is wrong;
-//       (1) confirm the [CAL] line for that room, (2) check wiring/pot for that pin,
-//       (3) if disconnected, set FLAME_SENSOR_ENABLED[i]=false temporarily,
-//       (4) or set AUTO_CALIBRATE_FLAME_SAFE_LEVEL=false and tune MANUAL_FLAME_DETECTED_LEVELS[i].
-//   * [TELEM] shows mq2 baseline > threshold after warm -> raise SMOKE_THRESHOLDS[i],
-//       or keep USE_SMOKE_BASELINE_THRESHOLD=true and tune SMOKE_DELTA_THRESHOLD,
-//       or raise SMOKE_STARTUP_IGNORE_MS to let the sensor warm up longer
+// =============================================================
+// BUZZER POLARITY — flip ONE constant to match your module
+// =============================================================
+// Set this to true  if applying +5V (HIGH) to D12 makes the buzzer sound
+//   (typical for bare 2-pin piezo buzzers wired + -> D12, - -> GND).
+// Set this to false if applying  0V (LOW)  to D12 makes the buzzer sound
+//   (typical for 3-pin "active buzzer" modules with onboard transistor,
+//    and for 2-pin buzzers wired + -> 5V, - -> D12).
 //
-// After running the BUZZER HARDWARE PROOF tests below, set these two
-// constants according to which test made the buzzer beep:
+// SYMPTOM -> ACTION:
+//   * Buzzer beeps continuously at boot with no fire/smoke present
+//     -> flip BUZZER_ACTIVE_HIGH to the OPPOSITE value, re-flash.
+//   * Buzzer stays SILENT during a confirmed flame ([FIRE] in Serial)
+//     -> flip BUZZER_ACTIVE_HIGH to the OPPOSITE value, re-flash.
 //
-//   If BUZZER_FORCE_PIN_LOW_TEST beeps and BUZZER_FORCE_PIN_HIGH_TEST is silent:
-//       const int BUZZER_ACTIVE_LEVEL   = LOW;
-//       const int BUZZER_INACTIVE_LEVEL = HIGH;
-//   If BUZZER_FORCE_PIN_HIGH_TEST beeps and BUZZER_FORCE_PIN_LOW_TEST is silent:
-//       const int BUZZER_ACTIVE_LEVEL   = HIGH;
-//       const int BUZZER_INACTIVE_LEVEL = LOW;
-//   If BOTH beep, or FLOAT beeps -> wiring is wrong, no firmware constant
-//       will fix it. See decision tree in the test plan.
-const int           BUZZER_ACTIVE_LEVEL     = HIGH;
-const int           BUZZER_INACTIVE_LEVEL   = LOW;
+// If both directions still misbehave, the buzzer is wired directly to
+// 5V/GND (not D12) — run BUZZER_FORCE_PIN_LOW_TEST below to prove it.
+//
+// Other diagnosis hints (read [TELEM] lines on Serial @ 115200):
+//   * [TELEM] shows flame=YES on a room with no flame -> a per-room safe
+//     baseline is wrong; check the [CAL] line, wiring/pot for that pin,
+//     or temporarily set FLAME_SENSOR_ENABLED[i]=false.
+//   * [TELEM] shows mq2 baseline > threshold after warm -> raise
+//     SMOKE_THRESHOLDS[i] or tune SMOKE_DELTA_THRESHOLD.
+const bool          BUZZER_ACTIVE_HIGH      = false;             // <-- one-knob polarity flip
+const int           BUZZER_ON_LEVEL         = BUZZER_ACTIVE_HIGH ? HIGH : LOW;
+const int           BUZZER_OFF_LEVEL        = BUZZER_ACTIVE_HIGH ? LOW  : HIGH;
+// Legacy aliases — used throughout the rest of the sketch (setBuzzer(),
+// proof tests, telemetry). Defined in terms of the derived levels so
+// retuning polarity only requires editing BUZZER_ACTIVE_HIGH above.
+const int           BUZZER_ACTIVE_LEVEL     = BUZZER_ON_LEVEL;
+const int           BUZZER_INACTIVE_LEVEL   = BUZZER_OFF_LEVEL;
 const bool          RELAY_ACTIVE_LOW        = true;  // most 8-ch relay boards energize when IN pulled LOW
 
 // --- Buzzer hardware diagnostics (set to 'true' temporarily to isolate
@@ -214,7 +221,7 @@ const int           MANUAL_FLAME_DETECTED_LEVELS[5] = { LOW, LOW, LOW, LOW, LOW 
 // one channel at a time during commissioning to find a misbehaving MQ-2
 // without the others piling on. Disabled rooms are still sampled (so the
 // raw value shows up in telemetry) but never trigger a smoke alert.
-const bool          SMOKE_SENSOR_ENABLED[5] = { false, false, false, false, false };
+const bool          SMOKE_SENSOR_ENABLED[5] = { true, true, true, true, true };
 
 // Per-room absolute smoke threshold (raw 0..1023). Used when
 // USE_SMOKE_BASELINE_THRESHOLD is false, OR before baseline capture
@@ -237,7 +244,13 @@ const uint8_t       SMOKE_SAMPLES           = 8;     // rolling-average window f
 const uint32_t      FLAME_DEBOUNCE_MS       = 250;   // flame line must hold state this long
 const uint32_t      NOTIFICATION_DELAY_MS   = 3000;  // delay before firing one-shot notification
 const unsigned long SMOKE_STARTUP_IGNORE_MS = 30000; // suppress smoke alerts during MQ-2 warm-up
-const bool          TURN_OFF_LIGHT_ON_SMOKE = false;
+
+// Maximum time the buzzer is allowed to sound for a single hazard event
+// before auto-silencing. Lights stay OFF (lockout) until /reset-alert; only
+// the buzzer is gated by this timeout. When the hazard CLEARS and a NEW
+// hazard arises, the buzzer is re-armed and sounds again for up to this
+// many milliseconds. Set to 0 to disable auto-silence (legacy behavior).
+const unsigned long BUZZER_ALARM_MS         = 120000UL; // 2 minutes
 
 // --- Pins (array index 0..4 == room 1..5)
 const uint8_t FLAME_PINS[5] = {2, 3, 4, 5, 6};
@@ -287,6 +300,17 @@ uint32_t bootMs          = 0;
 uint32_t lastWifiAttempt = 0;
 bool     serverStarted   = false;
 
+// Buzzer auto-silence state machine. The buzzer is driven by the CURRENT
+// sensor reading (currentHazard), NOT the latched fireLockout, so a stuck
+// latch can no longer hold the buzzer on forever. alarmStartedAt is the
+// millis() of the rising edge of the current hazard; buzzerTimedOut latches
+// true once the elapsed time exceeds BUZZER_ALARM_MS; prevHazardActive
+// tracks the previous loop's hazard state for edge detection.
+uint32_t alarmStartedAt   = 0;
+bool     buzzerTimedOut   = false;
+bool     prevHazardActive = false;
+uint32_t buzzerOnUntilMs  = 0;      // 0 when silent; otherwise millis() when timeout will fire
+
 // Last level actually written to D12 (HIGH or LOW). Updated only when
 // digitalWrite() is invoked. Reported in [TELEM] so a firmware-vs-wiring
 // mismatch is visible from Serial alone — if `buzzerCmd=OFF` but
@@ -330,6 +354,7 @@ bool     flameStuckWarningShown[ROOM_COUNT] = {false, false, false, false, false
 //   "smoke"                     — at least one room is above smoke threshold/delta
 //   "flame+smoke"               — both above are true
 //   "latched"                   — sensors clear but a fireLockout is still held
+//   "timed_out"                 — hazard still present but BUZZER_ALARM_MS expired
 //   "force_disabled"            — BUZZER_FORCE_DISABLED short-circuited an alert
 //   "diagnostic"                — BUZZER_DIAGNOSTIC_MODE owns the pin
 const char *buzzerReason = "off";
@@ -360,6 +385,9 @@ void     readSensors(uint32_t now);
 void     updateAlerts(uint32_t now);
 void     setLight(uint8_t roomIndex, bool on);
 void     setBuzzer(bool on, const char *reason);
+bool     anyFireDetected();
+bool     anySmokeDetected();
+void     tripAllLightsForHazard();
 bool     buzzerProofActive(const char *&selectedTest);
 void     applyBuzzerProof(const char *selectedTest, bool firstCall);
 void     handleHttpClient();
@@ -376,6 +404,18 @@ const char *statusText(int code);
 // ============================================================
 
 void setup() {
+  // *** FIRST THING WE DO ***
+  // Park D12 at the buzzer's OFF level the instant we have CPU time —
+  // before Serial.begin() and its 100 ms USB CDC delay. This minimizes
+  // the floating-input window at boot from ~100 ms down to microseconds
+  // so the buzzer cannot chirp during board reset. Polarity is governed
+  // entirely by BUZZER_ACTIVE_HIGH at the top of this file.
+  digitalWrite(BUZZER_PIN, BUZZER_OFF_LEVEL); // enables matching pullup while still INPUT
+  pinMode(BUZZER_PIN, OUTPUT);                // start actively driving the pin
+  digitalWrite(BUZZER_PIN, BUZZER_OFF_LEVEL); // re-assert hard drive after pinMode
+  lastBuzzerPinLevel = BUZZER_OFF_LEVEL;
+  buzzerOn = false;
+
   Serial.begin(115200);
   delay(100); // brief startup window for the USB CDC serial to attach
 
@@ -414,10 +454,19 @@ void setup() {
   }
   Serial.print(F("[CFG] USE_MANUAL_FLAME_LEVELS_DURING_COMMISSIONING="));
   Serial.println(USE_MANUAL_FLAME_LEVELS_DURING_COMMISSIONING ? F("YES") : F("no"));
-  Serial.print(F("[CFG] BUZZER_ACTIVE_LEVEL="));
-  Serial.println(BUZZER_ACTIVE_LEVEL == HIGH ? F("HIGH") : F("LOW"));
-  Serial.print(F("[CFG] BUZZER_INACTIVE_LEVEL="));
-  Serial.println(BUZZER_INACTIVE_LEVEL == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("[CFG] BUZZER_ACTIVE_HIGH="));
+  Serial.print(BUZZER_ACTIVE_HIGH ? F("YES") : F("no"));
+  Serial.print(F("  ON_LEVEL="));
+  Serial.print(BUZZER_ON_LEVEL == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("  OFF_LEVEL="));
+  Serial.println(BUZZER_OFF_LEVEL == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("[CFG] BUZZER_ALARM_MS="));
+  Serial.print(BUZZER_ALARM_MS);
+  if (BUZZER_ALARM_MS == 0) {
+    Serial.println(F(" (auto-silence disabled)"));
+  } else {
+    Serial.println();
+  }
   Serial.print(F("[CFG] BUZZER_FORCE_DISABLED="));
   Serial.println(BUZZER_FORCE_DISABLED ? F("YES (alerts suppressed)") : F("no"));
   Serial.print(F("[CFG] BUZZER_DIAGNOSTIC_MODE="));
@@ -525,13 +574,8 @@ void setup() {
   } else if (USE_MANUAL_FLAME_LEVELS_DURING_COMMISSIONING) {
     Serial.println(F("[CAL] Auto-cal bypassed: MANUAL_FLAME_DETECTED_LEVELS[] is authoritative."));
   }
-  // Same pre-load order for the buzzer. Whichever level is INACTIVE for the
-  // user's module gets latched onto the output BEFORE we switch the pin to
-  // OUTPUT, so the buzzer can never beep during the boot transition.
-  digitalWrite(BUZZER_PIN, BUZZER_INACTIVE_LEVEL);
-  pinMode(BUZZER_PIN, OUTPUT);
-  buzzerOn = false;
-  lastBuzzerPinLevel = BUZZER_INACTIVE_LEVEL;
+  // Buzzer is already parked at BUZZER_OFF_LEVEL by the pre-Serial init at
+  // the very top of setup(), so we don't re-touch it here.
 
   // Try WiFi with a bounded wait. loop() will keep retrying if this fails.
   if (strcmp(SECRET_SSID, "YOUR_WIFI_SSID") == 0 ||
@@ -900,10 +944,7 @@ void updateAlerts(uint32_t now) {
       if (r.flameDetected && !prev) {
         Serial.print(F("[FIRE] room="));
         Serial.println(i + 1);
-        for (uint8_t j = 0; j < ROOM_COUNT; j++) {
-          setLight(j, false);
-          rooms[j].fireLockout = true;
-        }
+        tripAllLightsForHazard();
         r.fireAlertSinceMs = now;
         r.notifiedFire     = false;
         lastAlertRoom      = i;
@@ -959,7 +1000,14 @@ void updateAlerts(uint32_t now) {
       Serial.print(F(" warmup="));
       Serial.print(warmedUp ? F("no") : F("yes"));
       Serial.println(F(" alert=YES"));
-      if (!COMMISSIONING_MODE && TURN_OFF_LIGHT_ON_SMOKE) setLight(i, false);
+      // Smoke now triggers the same building-wide hazard trip as fire:
+      // every light is cut and every room's fireLockout is latched so the
+      // visual "all dark" alarm holds until /reset-alert clears it.
+      if (!COMMISSIONING_MODE) {
+        Serial.print(F("[SMOKE_TRIP] room="));
+        Serial.println(i + 1);
+        tripAllLightsForHazard();
+      }
     } else if (!smokeOver && r.smokeAlert) {
       r.smokeAlert    = false;
       r.notifiedSmoke = false; // allow re-notify on next crossing
@@ -1004,21 +1052,64 @@ void updateAlerts(uint32_t now) {
       rooms[i].notifiedFire    = false;
       rooms[i].notifiedSmoke   = false;
     }
-    globalAlert = false;
+    globalAlert      = false;
+    alarmStartedAt   = 0;
+    buzzerTimedOut   = false;
+    prevHazardActive = false;
+    buzzerOnUntilMs  = 0;
     setBuzzer(false, wouldHaveSensorAlert ? "commissioning_suppressed" : "off");
   } else {
-    // Safety mode: a held fireLockout keeps the buzzer screaming even after
-    // the sensor itself has cleared, so the user knows to inspect the room
-    // and acknowledge via /reset-alert.
+    // Safety mode (new auto-silence model):
+    //   * currentHazard tracks CURRENT sensor readings, not the latched
+    //     fireLockout. The buzzer follows currentHazard, so a stuck latch
+    //     can no longer hold the buzzer on forever.
+    //   * On the rising edge of currentHazard we record alarmStartedAt and
+    //     clear buzzerTimedOut. The buzzer runs for up to BUZZER_ALARM_MS
+    //     and then auto-silences (buzzerTimedOut=true). Lights stay OFF
+    //     because fireLockout is still latched.
+    //   * On the falling edge (sensors clear) we re-arm by zeroing the
+    //     timeout state so the NEXT hazard can sound again.
+    //   * globalAlert (used by /status and the app's red banner) still
+    //     reflects "system is alarming" — it includes anyLockout — so the
+    //     UI shows an active alarm even when the buzzer has timed out.
+    bool currentHazard = wouldHaveSensorAlert;
+
+    if (currentHazard && !prevHazardActive) {
+      alarmStartedAt = now;
+      buzzerTimedOut = false;
+      Serial.print(F("[ALARM] start reason="));
+      Serial.println(sensorReason);
+    }
+    if (!currentHazard && prevHazardActive) {
+      buzzerTimedOut  = false;
+      alarmStartedAt  = 0;
+      buzzerOnUntilMs = 0;
+      Serial.println(F("[ALARM] sensor cleared (lockout still latched if any)"));
+    }
+    if (currentHazard && !buzzerTimedOut && BUZZER_ALARM_MS > 0 &&
+        (now - alarmStartedAt) >= BUZZER_ALARM_MS) {
+      buzzerTimedOut = true;
+      Serial.print(F("[ALARM] buzzer auto-silenced after "));
+      Serial.print(BUZZER_ALARM_MS / 1000);
+      Serial.println(F(" s"));
+    }
+    prevHazardActive = currentHazard;
+
     bool anyLockout = false;
     for (uint8_t i = 0; i < ROOM_COUNT; i++) {
       if (rooms[i].fireLockout) { anyLockout = true; break; }
     }
-    bool actualAlert = wouldHaveSensorAlert || anyLockout;
-    globalAlert = actualAlert;
-    const char *reason = sensorReason;
-    if (anyLockout && !wouldHaveSensorAlert) reason = "latched";
-    setBuzzer(actualAlert, actualAlert ? reason : "off");
+    bool actualAlert      = currentHazard || anyLockout;
+    bool buzzerShouldBeOn = currentHazard && !buzzerTimedOut;
+    globalAlert     = actualAlert;
+    buzzerOnUntilMs = buzzerShouldBeOn ? (alarmStartedAt + BUZZER_ALARM_MS) : 0;
+
+    const char *reason;
+    if      (buzzerShouldBeOn)                 reason = sensorReason;   // flame / smoke / flame+smoke
+    else if (currentHazard && buzzerTimedOut)  reason = "timed_out";
+    else if (anyLockout)                       reason = "latched";      // lights still off, buzzer silent
+    else                                       reason = "off";
+    setBuzzer(buzzerShouldBeOn, reason);
   }
 }
 
@@ -1080,6 +1171,33 @@ void applyBuzzerProof(const char *selectedTest, bool firstCall) {
       Serial.println(F("[BUZZER_PROOF] D12 forced LOW forever."));
       Serial.println(F("[BUZZER_PROOF] If buzzer beeps, it is active-low OR wired incorrectly."));
     }
+  }
+}
+
+// True if any enabled flame sensor has confirmed flame (post-debounce).
+bool anyFireDetected() {
+  for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    if (FLAME_SENSOR_ENABLED[i] && rooms[i].flameDetected) return true;
+  }
+  return false;
+}
+
+// True if any enabled smoke sensor is currently above its threshold/delta.
+bool anySmokeDetected() {
+  for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    if (SMOKE_SENSOR_ENABLED[i] && rooms[i].smokeAlert) return true;
+  }
+  return false;
+}
+
+// Building-wide hazard trip: cut every light, latch lockout on every room.
+// Idempotent — safe to call repeatedly. Used by BOTH flame and smoke rising
+// edges so smoke produces identical observable safety behavior to fire
+// (lights off + manual /light POST blocked + /reset-alert required).
+void tripAllLightsForHazard() {
+  for (uint8_t j = 0; j < ROOM_COUNT; j++) {
+    setLight(j, false);
+    rooms[j].fireLockout = true;
   }
 }
 
@@ -1145,10 +1263,22 @@ void logTelemetry(uint32_t now) {
   Serial.print(WiFi.status() == WL_CONNECTED ? F("up") : F("down"));
   Serial.print(F(" commissioning="));
   Serial.print(COMMISSIONING_MODE ? F("YES") : F("no"));
+  bool fireNow  = anyFireDetected();
+  bool smokeNow = anySmokeDetected();
   Serial.print(F(" wouldAlert="));
   Serial.print(wouldAlert ? F("YES") : F("no"));
   Serial.print(F(" actualAlert="));
   Serial.print(globalAlert ? F("YES") : F("no"));
+  Serial.print(F(" alarmActive="));
+  Serial.print((fireNow || smokeNow) ? F("YES") : F("no"));
+  Serial.print(F(" fireDetected="));
+  Serial.print(fireNow  ? F("YES") : F("no"));
+  Serial.print(F(" smokeDetected="));
+  Serial.print(smokeNow ? F("YES") : F("no"));
+  Serial.print(F(" buzzerTimedOut="));
+  Serial.print(buzzerTimedOut ? F("YES") : F("no"));
+  Serial.print(F(" buzzerOnUntilMs="));
+  Serial.print(buzzerOnUntilMs);
   Serial.print(F(" buzzerCmd="));
   Serial.print(buzzerOn ? F("ON") : F("OFF"));
   Serial.print(F(" buzzerPinWrite="));
@@ -1230,8 +1360,12 @@ bool resetAlertsIfSafe() {
     rooms[i].notifiedFire  = false;
     rooms[i].notifiedSmoke = false;
   }
-  globalAlert   = false;
-  lastAlertRoom = -1;
+  globalAlert      = false;
+  lastAlertRoom    = -1;
+  alarmStartedAt   = 0;
+  buzzerTimedOut   = false;
+  prevHazardActive = false;
+  buzzerOnUntilMs  = 0;
   setBuzzer(false, "off");
   Serial.println(F("[RESET] alerts cleared"));
   return true;
@@ -1403,8 +1537,12 @@ void handleHttpClient() {
           rooms[i].smokeAlert    = false;
           rooms[i].notifiedSmoke = false;
         }
-        globalAlert   = false;
-        lastAlertRoom = -1;
+        globalAlert      = false;
+        lastAlertRoom    = -1;
+        alarmStartedAt   = 0;
+        buzzerTimedOut   = false;
+        prevHazardActive = false;
+        buzzerOnUntilMs  = 0;
         setBuzzer(false, "off");
         Serial.println(F("[RESET] alerts cleared (commissioning mode)"));
         sendResponse(httpClient, 200, "application/json",
@@ -1502,6 +1640,22 @@ void sendJsonStatus(WiFiClient &client) {
   body += buzzerReason;
   body += "\",\"alertActive\":";
   body += (globalAlert ? "true" : "false");
+  bool _fireNow  = anyFireDetected();
+  bool _smokeNow = anySmokeDetected();
+  body += ",\"alarmActive\":";
+  body += ((_fireNow || _smokeNow) ? "true" : "false");
+  body += ",\"fireDetected\":";
+  body += (_fireNow ? "true" : "false");
+  body += ",\"smokeDetected\":";
+  body += (_smokeNow ? "true" : "false");
+  body += ",\"buzzerTimedOut\":";
+  body += (buzzerTimedOut ? "true" : "false");
+  body += ",\"buzzerOnUntilMs\":";
+  body += buzzerOnUntilMs;
+  body += ",\"buzzerAlarmMs\":";
+  body += (uint32_t)BUZZER_ALARM_MS;
+  body += ",\"buzzerActiveHigh\":";
+  body += (BUZZER_ACTIVE_HIGH ? "true" : "false");
   body += ",\"flameCalibrationComplete\":";
   body += (flameCalibrationComplete ? "true" : "false");
   body += ",\"smokeBaselineReady\":";
