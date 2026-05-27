@@ -83,7 +83,7 @@ const uint32_t HTTP_CLIENT_TIMEOUT_MS     = 2000;   // drop a slow/silent HTTP c
 //     or temporarily set FLAME_SENSOR_ENABLED[i]=false.
 //   * [TELEM] shows mq2 baseline > threshold after warm -> raise
 //     SMOKE_THRESHOLDS[i] or tune SMOKE_DELTA_THRESHOLD.
-const bool          BUZZER_ACTIVE_HIGH      = false;             // <-- one-knob polarity flip
+const bool          BUZZER_ACTIVE_HIGH      = true;              // <-- one-knob polarity flip (hardware is active-HIGH, confirmed in PR #9)
 const int           BUZZER_ON_LEVEL         = BUZZER_ACTIVE_HIGH ? HIGH : LOW;
 const int           BUZZER_OFF_LEVEL        = BUZZER_ACTIVE_HIGH ? LOW  : HIGH;
 // Legacy aliases — used throughout the rest of the sketch (setBuzzer(),
@@ -183,7 +183,7 @@ const uint8_t       FLAME_CONFIRMATION_SAMPLES   = 3;
 // Set AUTO_CALIBRATE_FLAME_SAFE_LEVEL=false to skip learning and use
 // MANUAL_FLAME_DETECTED_LEVELS[] verbatim — useful only if calibration is
 // unreliable for a given board.
-const bool          AUTO_CALIBRATE_FLAME_SAFE_LEVEL = true;
+const bool          AUTO_CALIBRATE_FLAME_SAFE_LEVEL = false;
 const unsigned long FLAME_CALIBRATION_MS            = 5000;
 
 // Per-room enable. During commissioning, set ONE entry to true at a time so
