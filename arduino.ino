@@ -82,8 +82,8 @@ const uint32_t HTTP_CLIENT_TIMEOUT_MS     = 2000;   // drop a slow/silent HTTP c
 //       const int BUZZER_INACTIVE_LEVEL = LOW;
 //   If BOTH beep, or FLOAT beeps -> wiring is wrong, no firmware constant
 //       will fix it. See decision tree in the test plan.
-const int           BUZZER_ACTIVE_LEVEL     = HIGH;
-const int           BUZZER_INACTIVE_LEVEL   = LOW;
+const int           BUZZER_ACTIVE_LEVEL     = LOW;
+const int           BUZZER_INACTIVE_LEVEL   = HIGH;
 const bool          RELAY_ACTIVE_LOW        = true;  // most 8-ch relay boards energize when IN pulled LOW
 
 // --- Buzzer hardware diagnostics (set to 'true' temporarily to isolate
@@ -148,7 +148,7 @@ const bool          BUZZER_FLOAT_PIN_TEST        = false;
 // Telemetry will report `commissioning=YES wouldAlert=... actualAlert=no
 // buzzerCmd=OFF reason=commissioning_suppressed` so you can iterate on
 // thresholds and polarity without ever firing the alarm.
-const bool COMMISSIONING_MODE = true;
+const bool COMMISSIONING_MODE = false;
 
 // If a sensor's auto-calibrated safe level is wrong (e.g. rooms 2/3 in
 // the field telemetry learned safe=H but then immediately read raw=L),
@@ -156,7 +156,7 @@ const bool COMMISSIONING_MODE = true;
 // MANUAL_FLAME_DETECTED_LEVELS[] entries below. Useful when calibration
 // keeps learning the wrong baseline because a sensor is flipping state
 // during the 5 s calibration window.
-const bool USE_MANUAL_FLAME_LEVELS_DURING_COMMISSIONING = true;
+const bool USE_MANUAL_FLAME_LEVELS_DURING_COMMISSIONING = false;
 
 // Optional stronger anti-flicker for noisy flame sensors. After the
 // FLAME_DEBOUNCE_MS window, additionally require this many consecutive
@@ -187,7 +187,7 @@ const unsigned long FLAME_CALIBRATION_MS            = 5000;
 // updateAlerts() clears any lingering lockout.
 // Length is hard-coded to 5 to match the rest of the per-room arrays; if you
 // change ROOM_COUNT, update the initializer list below as well.
-const bool          FLAME_SENSOR_ENABLED[5] = { true, false, false, false, false };
+const bool          FLAME_SENSOR_ENABLED[5] = { true, true, true, true, true };
 
 // Used when AUTO_CALIBRATE_FLAME_SAFE_LEVEL == false OR when
 // USE_MANUAL_FLAME_LEVELS_DURING_COMMISSIONING == true. Specifies the
@@ -207,7 +207,7 @@ const bool          FLAME_SENSOR_ENABLED[5] = { true, false, false, false, false
 // LOW (because raw=H at rest would be interpreted as flame), and flip to
 // LOW once you've confirmed the polarity from telemetry. COMMISSIONING_MODE
 // keeps the buzzer silent while you decide. Length must match ROOM_COUNT (5).
-const int           MANUAL_FLAME_DETECTED_LEVELS[5] = { HIGH, HIGH, HIGH, HIGH, HIGH };
+const int           MANUAL_FLAME_DETECTED_LEVELS[5] = { LOW, LOW, LOW, LOW, LOW };
 
 // --- Detection tuning
 // Per-room smoke sensor enable. Same idea as FLAME_SENSOR_ENABLED — turn on
@@ -893,12 +893,17 @@ void updateAlerts(uint32_t now) {
     }
 
     if (!COMMISSIONING_MODE) {
-      // Rising edge: fire just confirmed -> immediate cut-off + lockout
+      // Rising edge: fire just confirmed -> system-wide cut-off + lockout.
+      // Any room's fire kills every light and latches every room's lockout
+      // so the visual "all dark" alarm covers the whole building until a
+      // human acknowledges via /reset-alert.
       if (r.flameDetected && !prev) {
         Serial.print(F("[FIRE] room="));
         Serial.println(i + 1);
-        setLight(i, false);
-        r.fireLockout      = true;
+        for (uint8_t j = 0; j < ROOM_COUNT; j++) {
+          setLight(j, false);
+          rooms[j].fireLockout = true;
+        }
         r.fireAlertSinceMs = now;
         r.notifiedFire     = false;
         lastAlertRoom      = i;
