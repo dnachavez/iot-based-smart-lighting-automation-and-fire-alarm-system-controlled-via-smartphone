@@ -82,8 +82,8 @@ const uint32_t HTTP_CLIENT_TIMEOUT_MS     = 2000;   // drop a slow/silent HTTP c
 //       const int BUZZER_INACTIVE_LEVEL = LOW;
 //   If BOTH beep, or FLOAT beeps -> wiring is wrong, no firmware constant
 //       will fix it. See decision tree in the test plan.
-const int           BUZZER_ACTIVE_LEVEL     = LOW;
-const int           BUZZER_INACTIVE_LEVEL   = HIGH;
+const int           BUZZER_ACTIVE_LEVEL     = HIGH;
+const int           BUZZER_INACTIVE_LEVEL   = LOW;
 const bool          RELAY_ACTIVE_LOW        = true;  // most 8-ch relay boards energize when IN pulled LOW
 
 // --- Buzzer hardware diagnostics (set to 'true' temporarily to isolate
