@@ -16,11 +16,15 @@
       after NOTIFICATION_DELAY_MS. Smoke and fire share the same safety
       path (see tripAllLightsForHazard()).
     * The buzzer auto-silences after BUZZER_ALARM_MS (default 2 min) even
-      if the hazard persists. Lights stay OFF (lockout) until /reset-alert.
-      Hazard clears then returns -> buzzer re-arms and sounds again.
+      if the hazard persists. The alarm episode ends only after every hazard
+      is clear for REARM_CLEAR_HOLD_MS (default 2 s), which prevents
+      re-trigger chirps on noisy sensors.
+    * By default, lockout auto-restores pre-trip light states after the
+      episode clear-hold completes. /reset-alert is still available for
+      manual acknowledgement/override.
     * The mobile app (future React Native) calls a small local JSON HTTP API
       to read status, toggle lights, and acknowledge alerts.
-    * /reset-alert only clears state if every sensor currently reads safe.
+    * /reset-alert clears state only if every sensor currently reads safe.
 
   =========================  SAFETY  ====================================
   The relay module switches 220V AC mains. Mains wiring is LETHAL.
@@ -251,6 +255,9 @@ const unsigned long SMOKE_STARTUP_IGNORE_MS = 30000; // suppress smoke alerts du
 // hazard arises, the buzzer is re-armed and sounds again for up to this
 // many milliseconds. Set to 0 to disable auto-silence (legacy behavior).
 const unsigned long BUZZER_ALARM_MS         = 120000UL; // 2 minutes
+const bool          AUTO_RESTORE_ON_SAFE    = true;     // auto-clear lockout when hazard stays safe
+const uint32_t      REARM_CLEAR_HOLD_MS     = 2000;     // 2 s continuous safe required to end episode
+const char          RESTORE_MODE[]          = "pre_trip_states";
 
 // --- Pins (array index 0..4 == room 1..5)
 const uint8_t FLAME_PINS[5] = {2, 3, 4, 5, 6};
@@ -300,16 +307,25 @@ uint32_t bootMs          = 0;
 uint32_t lastWifiAttempt = 0;
 bool     serverStarted   = false;
 
-// Buzzer auto-silence state machine. The buzzer is driven by the CURRENT
-// sensor reading (currentHazard), NOT the latched fireLockout, so a stuck
-// latch can no longer hold the buzzer on forever. alarmStartedAt is the
-// millis() of the rising edge of the current hazard; buzzerTimedOut latches
-// true once the elapsed time exceeds BUZZER_ALARM_MS; prevHazardActive
-// tracks the previous loop's hazard state for edge detection.
-uint32_t alarmStartedAt   = 0;
-bool     buzzerTimedOut   = false;
-bool     prevHazardActive = false;
-uint32_t buzzerOnUntilMs  = 0;      // 0 when silent; otherwise millis() when timeout will fire
+// Hazard episode controller.
+// - hazardActiveNow: any current fire/smoke reading
+// - episodeActive: hazard episode currently latched (survives brief clears)
+// - episodeStartedAt: rising edge timestamp of the episode
+// - clearSinceMs: when hazardActiveNow first went false inside an active episode
+// - episodeTimedOut: buzzer timeout state for this episode
+// - rearmed: true when the system is ready for a brand-new episode
+// - autoRestorePending: waiting for clear-hold completion before auto restore
+bool     hazardActiveNow     = false;
+bool     episodeActive       = false;
+uint32_t episodeStartedAt    = 0;
+uint32_t clearSinceMs        = 0;
+bool     episodeTimedOut     = false;
+bool     rearmed             = true;
+bool     autoRestorePending  = false;
+uint32_t clearHoldRemainingMs = 0;
+uint32_t buzzerOnUntilMs     = 0;      // 0 when silent; otherwise millis() when timeout will fire
+bool     preTripSnapshotValid = false;
+bool     preTripLightState[ROOM_COUNT] = {false, false, false, false, false};
 
 // Last level actually written to D12 (HIGH or LOW). Updated only when
 // digitalWrite() is invoked. Reported in [TELEM] so a firmware-vs-wiring
@@ -345,18 +361,19 @@ bool     flameCalibrationComplete          = false;
 uint32_t flameCalibrationStartedAt         = 0;
 bool     flameStuckWarningShown[ROOM_COUNT] = {false, false, false, false, false};
 
-// Why is the buzzer on right now? Surfaced in [TELEM] + /status so the user
-// can immediately see which subsystem is driving the alarm without digging.
+// Why is the alarm active right now? Surfaced in [TELEM] + /status.
 // Possible values:
-//   "off"                       — no sensor alert, no latch
+//   "off"                       — no active episode
 //   "commissioning_suppressed"  — wouldAlert=true but COMMISSIONING_MODE muted it
 //   "flame"                     — at least one room has confirmed flame
 //   "smoke"                     — at least one room is above smoke threshold/delta
 //   "flame+smoke"               — both above are true
-//   "latched"                   — sensors clear but a fireLockout is still held
+//   "clear_hold"                — sensors safe, waiting REARM_CLEAR_HOLD_MS
 //   "timed_out"                 — hazard still present but BUZZER_ALARM_MS expired
+//   "latched"                   — lockout still held (auto-restore disabled)
 //   "force_disabled"            — BUZZER_FORCE_DISABLED short-circuited an alert
 //   "diagnostic"                — BUZZER_DIAGNOSTIC_MODE owns the pin
+const char *alarmReason  = "off";
 const char *buzzerReason = "off";
 
 // Smoke baseline tracking (analogous to flameSafeLevels[]). During the
@@ -388,6 +405,9 @@ void     setBuzzer(bool on, const char *reason);
 bool     anyFireDetected();
 bool     anySmokeDetected();
 void     tripAllLightsForHazard();
+void     clearAllFireLockouts();
+void     snapshotPreTripLights();
+void     restorePreTripLights();
 bool     buzzerProofActive(const char *&selectedTest);
 void     applyBuzzerProof(const char *selectedTest, bool firstCall);
 void     handleHttpClient();
@@ -467,6 +487,12 @@ void setup() {
   } else {
     Serial.println();
   }
+  Serial.print(F("[CFG] AUTO_RESTORE_ON_SAFE="));
+  Serial.println(AUTO_RESTORE_ON_SAFE ? F("YES") : F("no"));
+  Serial.print(F("[CFG] REARM_CLEAR_HOLD_MS="));
+  Serial.println(REARM_CLEAR_HOLD_MS);
+  Serial.print(F("[CFG] RESTORE_MODE="));
+  Serial.println(RESTORE_MODE);
   Serial.print(F("[CFG] BUZZER_FORCE_DISABLED="));
   Serial.println(BUZZER_FORCE_DISABLED ? F("YES (alerts suppressed)") : F("no"));
   Serial.print(F("[CFG] BUZZER_DIAGNOSTIC_MODE="));
@@ -870,13 +896,13 @@ void readSensors(uint32_t now) {
 // Alert state machine
 // ============================================================
 // Computes per-room flame/smoke detection, then branches on COMMISSIONING_MODE:
-//   * Commissioning: report `wouldAlert` in telemetry, but do not latch fire
-//     lockout, do not cut lights, do not energise the buzzer. Lets the user
-//     iterate on sensor wiring/thresholds without ever firing the alarm.
-//   * Safety mode (production): existing behavior — flame rising edge cuts
-//     the light + latches `fireLockout`, smoke threshold cross fires a
-//     one-shot notification, buzzer follows the combined alert. If a sensor
-//     clears but a lockout is still held, buzzerReason becomes "latched".
+//   * Commissioning: report `wouldAlert` in telemetry, but do not latch
+//     lockout, do not cut lights, do not energise the buzzer.
+//   * Safety mode (production): run a deterministic hazard episode state
+//     machine. A new episode starts on first hazard detection, trips all
+//     lights, sounds buzzer, and auto-silences after BUZZER_ALARM_MS. Episode
+//     ends only after REARM_CLEAR_HOLD_MS of continuous safe readings; that
+//     avoids false re-arm chirps from brief sensor flicker.
 void updateAlerts(uint32_t now) {
   bool warmedUp = (now - bootMs) >= SMOKE_STARTUP_IGNORE_MS;
 
@@ -907,11 +933,10 @@ void updateAlerts(uint32_t now) {
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
     Room &r = rooms[i];
 
-    // Safety: a disabled flame sensor must never hold a lockout or pending
-    // notification. readSensors() already zeroes flameRaw; we clear the
-    // downstream state here so re-enabling at runtime is clean.
+    // Safety: a disabled flame sensor must never keep fire-side notify state.
+    // readSensors() already zeroes flameRaw; we clear fire-notify bookkeeping
+    // here so re-enabling at runtime is clean.
     if (!FLAME_SENSOR_ENABLED[i]) {
-      r.fireLockout      = false;
       r.notifiedFire     = false;
       r.fireAlertSinceMs = 0;
     }
@@ -937,25 +962,20 @@ void updateAlerts(uint32_t now) {
     }
 
     if (!COMMISSIONING_MODE) {
-      // Rising edge: fire just confirmed -> system-wide cut-off + lockout.
-      // Any room's fire kills every light and latches every room's lockout
-      // so the visual "all dark" alarm covers the whole building until a
-      // human acknowledges via /reset-alert.
+      // Rising edge: fire just confirmed. The global trip is triggered once
+      // at episode start below, not here, so flame/smoke edges share one path.
       if (r.flameDetected && !prev) {
         Serial.print(F("[FIRE] room="));
         Serial.println(i + 1);
-        tripAllLightsForHazard();
         r.fireAlertSinceMs = now;
         r.notifiedFire     = false;
         lastAlertRoom      = i;
       }
-      // Falling edge: sensor cleared (lockout persists until /reset-alert)
       if (!r.flameDetected && prev) {
         Serial.print(F("[FIRE] room="));
         Serial.print(i + 1);
-        Serial.println(F(" cleared (lockout still held until reset)"));
+        Serial.println(F(" cleared"));
       }
-      // Fire notification: one-shot, after stable delay
       if (r.flameDetected && !r.notifiedFire &&
           (now - r.fireAlertSinceMs) >= NOTIFICATION_DELAY_MS) {
         sendAlertNotification(i, "fire");
@@ -1000,14 +1020,6 @@ void updateAlerts(uint32_t now) {
       Serial.print(F(" warmup="));
       Serial.print(warmedUp ? F("no") : F("yes"));
       Serial.println(F(" alert=YES"));
-      // Smoke now triggers the same building-wide hazard trip as fire:
-      // every light is cut and every room's fireLockout is latched so the
-      // visual "all dark" alarm holds until /reset-alert clears it.
-      if (!COMMISSIONING_MODE) {
-        Serial.print(F("[SMOKE_TRIP] room="));
-        Serial.println(i + 1);
-        tripAllLightsForHazard();
-      }
     } else if (!smokeOver && r.smokeAlert) {
       r.smokeAlert    = false;
       r.notifiedSmoke = false; // allow re-notify on next crossing
@@ -1044,71 +1056,102 @@ void updateAlerts(uint32_t now) {
   else if (wouldHaveSmokeAlert)                        sensorReason = "smoke";
 
   if (COMMISSIONING_MODE) {
-    // Clear any latches that survived a previous safety-mode boot. This means
-    // toggling COMMISSIONING_MODE=true is a soft "reset everything" — useful
-    // when you flash a new build to silence a stuck alarm.
+    clearAllFireLockouts();
     for (uint8_t i = 0; i < ROOM_COUNT; i++) {
-      if (rooms[i].fireLockout) rooms[i].fireLockout = false;
       rooms[i].notifiedFire    = false;
       rooms[i].notifiedSmoke   = false;
     }
-    globalAlert      = false;
-    alarmStartedAt   = 0;
-    buzzerTimedOut   = false;
-    prevHazardActive = false;
-    buzzerOnUntilMs  = 0;
+    hazardActiveNow      = false;
+    episodeActive        = false;
+    episodeStartedAt     = 0;
+    clearSinceMs         = 0;
+    episodeTimedOut      = false;
+    rearmed              = true;
+    autoRestorePending   = false;
+    clearHoldRemainingMs = 0;
+    preTripSnapshotValid = false;
+    buzzerOnUntilMs      = 0;
+    alarmReason          = wouldHaveSensorAlert ? "commissioning_suppressed" : "off";
+    globalAlert          = false;
     setBuzzer(false, wouldHaveSensorAlert ? "commissioning_suppressed" : "off");
   } else {
-    // Safety mode (new auto-silence model):
-    //   * currentHazard tracks CURRENT sensor readings, not the latched
-    //     fireLockout. The buzzer follows currentHazard, so a stuck latch
-    //     can no longer hold the buzzer on forever.
-    //   * On the rising edge of currentHazard we record alarmStartedAt and
-    //     clear buzzerTimedOut. The buzzer runs for up to BUZZER_ALARM_MS
-    //     and then auto-silences (buzzerTimedOut=true). Lights stay OFF
-    //     because fireLockout is still latched.
-    //   * On the falling edge (sensors clear) we re-arm by zeroing the
-    //     timeout state so the NEXT hazard can sound again.
-    //   * globalAlert (used by /status and the app's red banner) still
-    //     reflects "system is alarming" — it includes anyLockout — so the
-    //     UI shows an active alarm even when the buzzer has timed out.
-    bool currentHazard = wouldHaveSensorAlert;
+    hazardActiveNow = wouldHaveSensorAlert;
 
-    if (currentHazard && !prevHazardActive) {
-      alarmStartedAt = now;
-      buzzerTimedOut = false;
+    if (!episodeActive && hazardActiveNow) {
+      snapshotPreTripLights();
+      tripAllLightsForHazard();
+      episodeActive        = true;
+      episodeStartedAt     = now;
+      clearSinceMs         = 0;
+      episodeTimedOut      = false;
+      rearmed              = false;
+      autoRestorePending   = AUTO_RESTORE_ON_SAFE;
+      clearHoldRemainingMs = 0;
       Serial.print(F("[ALARM] start reason="));
       Serial.println(sensorReason);
+      Serial.print(F("[TRIP] lights off + lockout latched restoreMode="));
+      Serial.println(RESTORE_MODE);
     }
-    if (!currentHazard && prevHazardActive) {
-      buzzerTimedOut  = false;
-      alarmStartedAt  = 0;
-      buzzerOnUntilMs = 0;
-      Serial.println(F("[ALARM] sensor cleared (lockout still latched if any)"));
+
+    if (episodeActive && hazardActiveNow) {
+      clearSinceMs         = 0;
+      clearHoldRemainingMs = 0;
+    } else if (episodeActive && !hazardActiveNow) {
+      if (clearSinceMs == 0) {
+        clearSinceMs = now;
+        Serial.println(F("[ALARM] hazard cleared; starting clear-hold timer"));
+      }
+      uint32_t elapsed = now - clearSinceMs;
+      if (elapsed >= REARM_CLEAR_HOLD_MS) {
+        clearHoldRemainingMs = 0;
+        if (AUTO_RESTORE_ON_SAFE) {
+          clearAllFireLockouts();
+          restorePreTripLights();
+          autoRestorePending = false;
+          Serial.println(F("[ALARM] clear-hold met; auto-restored pre-trip lights and cleared lockout"));
+        } else {
+          autoRestorePending = false;
+          Serial.println(F("[ALARM] clear-hold met; episode ended (lockout remains latched)"));
+        }
+        episodeActive        = false;
+        rearmed              = true;
+        episodeStartedAt     = 0;
+        clearSinceMs         = 0;
+        episodeTimedOut      = false;
+        buzzerOnUntilMs      = 0;
+      } else {
+        clearHoldRemainingMs = REARM_CLEAR_HOLD_MS - elapsed;
+      }
     }
-    if (currentHazard && !buzzerTimedOut && BUZZER_ALARM_MS > 0 &&
-        (now - alarmStartedAt) >= BUZZER_ALARM_MS) {
-      buzzerTimedOut = true;
+
+    if (episodeActive && !episodeTimedOut && BUZZER_ALARM_MS > 0 &&
+        (now - episodeStartedAt) >= BUZZER_ALARM_MS) {
+      episodeTimedOut = true;
       Serial.print(F("[ALARM] buzzer auto-silenced after "));
       Serial.print(BUZZER_ALARM_MS / 1000);
       Serial.println(F(" s"));
     }
-    prevHazardActive = currentHazard;
 
     bool anyLockout = false;
     for (uint8_t i = 0; i < ROOM_COUNT; i++) {
       if (rooms[i].fireLockout) { anyLockout = true; break; }
     }
-    bool actualAlert      = currentHazard || anyLockout;
-    bool buzzerShouldBeOn = currentHazard && !buzzerTimedOut;
-    globalAlert     = actualAlert;
-    buzzerOnUntilMs = buzzerShouldBeOn ? (alarmStartedAt + BUZZER_ALARM_MS) : 0;
+    bool buzzerShouldBeOn = episodeActive && !episodeTimedOut;
+    if (buzzerShouldBeOn && BUZZER_ALARM_MS > 0) {
+      buzzerOnUntilMs = episodeStartedAt + BUZZER_ALARM_MS;
+    } else {
+      buzzerOnUntilMs = 0;
+    }
+
+    globalAlert = episodeActive || hazardActiveNow || anyLockout;
 
     const char *reason;
-    if      (buzzerShouldBeOn)                 reason = sensorReason;   // flame / smoke / flame+smoke
-    else if (currentHazard && buzzerTimedOut)  reason = "timed_out";
-    else if (anyLockout)                       reason = "latched";      // lights still off, buzzer silent
-    else                                       reason = "off";
+    if      (hazardActiveNow && episodeTimedOut) reason = "timed_out";
+    else if (hazardActiveNow)                    reason = sensorReason;
+    else if (episodeActive)                      reason = "clear_hold";
+    else if (anyLockout)                         reason = "latched";
+    else                                         reason = "off";
+    alarmReason = reason;
     setBuzzer(buzzerShouldBeOn, reason);
   }
 }
@@ -1191,13 +1234,31 @@ bool anySmokeDetected() {
 }
 
 // Building-wide hazard trip: cut every light, latch lockout on every room.
-// Idempotent — safe to call repeatedly. Used by BOTH flame and smoke rising
-// edges so smoke produces identical observable safety behavior to fire
-// (lights off + manual /light POST blocked + /reset-alert required).
+// Idempotent — safe to call repeatedly. Used when a hazard episode starts.
 void tripAllLightsForHazard() {
   for (uint8_t j = 0; j < ROOM_COUNT; j++) {
     setLight(j, false);
     rooms[j].fireLockout = true;
+  }
+}
+
+void clearAllFireLockouts() {
+  for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    rooms[i].fireLockout = false;
+  }
+}
+
+void snapshotPreTripLights() {
+  for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    preTripLightState[i] = rooms[i].lightOn;
+  }
+  preTripSnapshotValid = true;
+}
+
+void restorePreTripLights() {
+  if (!preTripSnapshotValid) return;
+  for (uint8_t i = 0; i < ROOM_COUNT; i++) {
+    setLight(i, preTripLightState[i]);
   }
 }
 
@@ -1271,12 +1332,24 @@ void logTelemetry(uint32_t now) {
   Serial.print(globalAlert ? F("YES") : F("no"));
   Serial.print(F(" alarmActive="));
   Serial.print((fireNow || smokeNow) ? F("YES") : F("no"));
+  Serial.print(F(" episodeActive="));
+  Serial.print(episodeActive ? F("YES") : F("no"));
+  Serial.print(F(" episodeTimedOut="));
+  Serial.print(episodeTimedOut ? F("YES") : F("no"));
+  Serial.print(F(" rearmed="));
+  Serial.print(rearmed ? F("YES") : F("no"));
+  Serial.print(F(" clearHoldRemainingMs="));
+  Serial.print(clearHoldRemainingMs);
+  Serial.print(F(" autoRestorePending="));
+  Serial.print(autoRestorePending ? F("YES") : F("no"));
+  Serial.print(F(" restoreMode="));
+  Serial.print(RESTORE_MODE);
   Serial.print(F(" fireDetected="));
   Serial.print(fireNow  ? F("YES") : F("no"));
   Serial.print(F(" smokeDetected="));
   Serial.print(smokeNow ? F("YES") : F("no"));
   Serial.print(F(" buzzerTimedOut="));
-  Serial.print(buzzerTimedOut ? F("YES") : F("no"));
+  Serial.print(episodeTimedOut ? F("YES") : F("no"));
   Serial.print(F(" buzzerOnUntilMs="));
   Serial.print(buzzerOnUntilMs);
   Serial.print(F(" buzzerCmd="));
@@ -1287,6 +1360,8 @@ void logTelemetry(uint32_t now) {
   Serial.print(BUZZER_FORCE_DISABLED ? F("Y") : F("N"));
   Serial.print(F(" buzzer="));
   Serial.print(buzzerOn ? F("ON") : F("off"));
+  Serial.print(F(" alarmReason="));
+  Serial.print(alarmReason);
   Serial.print(F(" reason="));
   Serial.println(buzzerReason);
 
@@ -1356,16 +1431,23 @@ bool resetAlertsIfSafe() {
     }
   }
   for (uint8_t i = 0; i < ROOM_COUNT; i++) {
-    rooms[i].fireLockout   = false;
     rooms[i].notifiedFire  = false;
     rooms[i].notifiedSmoke = false;
   }
-  globalAlert      = false;
-  lastAlertRoom    = -1;
-  alarmStartedAt   = 0;
-  buzzerTimedOut   = false;
-  prevHazardActive = false;
-  buzzerOnUntilMs  = 0;
+  clearAllFireLockouts();
+  globalAlert          = false;
+  lastAlertRoom        = -1;
+  hazardActiveNow      = false;
+  episodeActive        = false;
+  episodeStartedAt     = 0;
+  clearSinceMs         = 0;
+  episodeTimedOut      = false;
+  rearmed              = true;
+  autoRestorePending   = false;
+  clearHoldRemainingMs = 0;
+  preTripSnapshotValid = false;
+  alarmReason          = "off";
+  buzzerOnUntilMs      = 0;
   setBuzzer(false, "off");
   Serial.println(F("[RESET] alerts cleared"));
   return true;
@@ -1532,17 +1614,24 @@ void handleHttpClient() {
         // it gives the user a one-call way to silence anything that was
         // already noisy when they entered commissioning mode.
         for (uint8_t i = 0; i < ROOM_COUNT; i++) {
-          rooms[i].fireLockout   = false;
           rooms[i].notifiedFire  = false;
           rooms[i].smokeAlert    = false;
           rooms[i].notifiedSmoke = false;
         }
-        globalAlert      = false;
-        lastAlertRoom    = -1;
-        alarmStartedAt   = 0;
-        buzzerTimedOut   = false;
-        prevHazardActive = false;
-        buzzerOnUntilMs  = 0;
+        clearAllFireLockouts();
+        globalAlert          = false;
+        lastAlertRoom        = -1;
+        hazardActiveNow      = false;
+        episodeActive        = false;
+        episodeStartedAt     = 0;
+        clearSinceMs         = 0;
+        episodeTimedOut      = false;
+        rearmed              = true;
+        autoRestorePending   = false;
+        clearHoldRemainingMs = 0;
+        preTripSnapshotValid = false;
+        alarmReason          = "off";
+        buzzerOnUntilMs      = 0;
         setBuzzer(false, "off");
         Serial.println(F("[RESET] alerts cleared (commissioning mode)"));
         sendResponse(httpClient, 200, "application/json",
@@ -1614,7 +1703,7 @@ void handleHttpClient() {
 
 void sendJsonStatus(WiFiClient &client) {
   String body;
-  body.reserve(1280);
+  body.reserve(1536);
   body += "{\"wifi\":{\"connected\":";
   body += (WiFi.status() == WL_CONNECTED ? "true" : "false");
   body += ",\"ip\":\"";
@@ -1642,18 +1731,43 @@ void sendJsonStatus(WiFiClient &client) {
   body += (globalAlert ? "true" : "false");
   bool _fireNow  = anyFireDetected();
   bool _smokeNow = anySmokeDetected();
+  uint32_t _now = millis();
+  uint32_t _clearRemaining = clearHoldRemainingMs;
+  if (episodeActive && !hazardActiveNow && clearSinceMs > 0) {
+    uint32_t elapsed = _now - clearSinceMs;
+    _clearRemaining = (elapsed >= REARM_CLEAR_HOLD_MS) ? 0 : (REARM_CLEAR_HOLD_MS - elapsed);
+  }
   body += ",\"alarmActive\":";
   body += ((_fireNow || _smokeNow) ? "true" : "false");
+  body += ",\"episodeActive\":";
+  body += (episodeActive ? "true" : "false");
+  body += ",\"episodeTimedOut\":";
+  body += (episodeTimedOut ? "true" : "false");
+  body += ",\"rearmed\":";
+  body += (rearmed ? "true" : "false");
+  body += ",\"clearHoldRemainingMs\":";
+  body += _clearRemaining;
+  body += ",\"autoRestorePending\":";
+  body += (autoRestorePending ? "true" : "false");
+  body += ",\"restoreMode\":\"";
+  body += RESTORE_MODE;
+  body += "\",\"alarmReason\":\"";
+  body += alarmReason;
+  body += "\"";
   body += ",\"fireDetected\":";
   body += (_fireNow ? "true" : "false");
   body += ",\"smokeDetected\":";
   body += (_smokeNow ? "true" : "false");
   body += ",\"buzzerTimedOut\":";
-  body += (buzzerTimedOut ? "true" : "false");
+  body += (episodeTimedOut ? "true" : "false");
   body += ",\"buzzerOnUntilMs\":";
   body += buzzerOnUntilMs;
   body += ",\"buzzerAlarmMs\":";
   body += (uint32_t)BUZZER_ALARM_MS;
+  body += ",\"rearmClearHoldMs\":";
+  body += (uint32_t)REARM_CLEAR_HOLD_MS;
+  body += ",\"autoRestoreOnSafe\":";
+  body += (AUTO_RESTORE_ON_SAFE ? "true" : "false");
   body += ",\"buzzerActiveHigh\":";
   body += (BUZZER_ACTIVE_HIGH ? "true" : "false");
   body += ",\"flameCalibrationComplete\":";
