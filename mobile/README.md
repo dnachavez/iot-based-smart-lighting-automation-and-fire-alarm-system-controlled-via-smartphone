@@ -48,7 +48,7 @@ Run through this after `npm install` and a fresh `npx expo start`:
 | 4 | Tap **All lights off** | All five room cards show `LIGHT OFF` |
 | 5 | Trigger a flame sensor (lighter, brief) | Banner turns red, siren loops, OS notification fires |
 | 6 | Tap **Mute alarm** | Siren stops; banner stays red |
-| 7 | Move flame away; wait ~2 s | Banner returns to green; lights auto-restore |
+| 7 | Move flame away; wait ~10 s | Banner returns to green; lights auto-restore |
 | 8 | Re-trigger flame | New notification fires (new `alertEpisodeId`); siren plays even though we previously muted |
 | 9 | Tap **Reset alert** while hazard still active | Alert "Cannot reset yet" with the blocking rooms |
 | 10 | Background the app, foreground it after 30 s | Polling resumes; banner reflects current state |

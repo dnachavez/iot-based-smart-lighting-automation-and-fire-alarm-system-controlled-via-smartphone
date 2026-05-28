@@ -26,7 +26,7 @@ const reasonText: Record<string, string> = {
   flame: 'Flame detected',
   smoke: 'Smoke detected',
   'flame+smoke': 'Flame and smoke detected',
-  clear_hold: 'Holding 2 s for clear-hold',
+  clear_hold: 'Holding 10 s for clear-hold',
   latched: 'Awaiting manual reset',
 };
 
