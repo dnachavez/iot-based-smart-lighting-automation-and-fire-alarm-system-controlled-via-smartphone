@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Fire Alarm",
+    "slug": "smart-lighting-fire-alarm",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": false,
+    "splash": {
+      "backgroundColor": "#0b0d10"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "dev.dnachavez.slfsa",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "package": "dev.dnachavez.slfsa",
+      "versionCode": 1,
+      "permissions": [
+        "android.permission.VIBRATE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE"
+      ],
+      "usesCleartextTraffic": true
+    },
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "color": "#ef4444"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "e116f4a7-ac5c-4b19-b7b5-ba627f01d686"
+      }
+    },
+    "owner": "dnachavez"
+  }
+}
