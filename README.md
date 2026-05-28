@@ -101,7 +101,7 @@ silent clients after 2 s.
   "alertEpisodeId": 0,
   "fireDetected": false,
   "smokeDetected": false,
-  "rearmClearHoldMs": 2000,
+  "rearmClearHoldMs": 10000,
   "autoRestoreOnSafe": true,
   "flameCalibrationComplete": true,
   "smokeBaselineReady": true,
@@ -164,9 +164,10 @@ verification checklist.
    - Every room shows `fireLockout: true` in `/status`.
    - The mobile app's banner turns red, the siren loops, and the OS fires a
      local notification.
-5. Remove the trigger. After two seconds of clean readings the firmware
+5. Remove the trigger. After ten seconds of clean readings the firmware
    logs `[ALARM] clear-hold met; auto-restored pre-trip lights` and the
-   app's banner returns to green.
+   app's banner returns to green. (Tunable via `REARM_CLEAR_HOLD_MS` in
+   `arduino.ino` — applies to both flame and smoke episodes.)
 6. Re-trigger to confirm a new `alertEpisodeId` (the app will fire a fresh
    notification — the previous one's mute does not carry over).
 

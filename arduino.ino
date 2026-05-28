@@ -20,8 +20,9 @@
       diagnostic notification after NOTIFICATION_DELAY_MS. Smoke and fire
       share the same safety path (see tripAllLightsForHazard()).
     * The alarm episode ends only after every hazard is clear for
-      REARM_CLEAR_HOLD_MS (default 2 s), which prevents re-trigger churn
-      on noisy sensors. The phone app deduplicates its siren / notification
+      REARM_CLEAR_HOLD_MS (default 10 s), which prevents re-trigger churn
+      on noisy sensors and gives lingering smoke time to dissipate before
+      lights restore. The phone app deduplicates its siren / notification
       via alertEpisodeId.
     * By default, lockout auto-restores pre-trip light states after the
       episode clear-hold completes. /reset-alert is still available for
@@ -170,7 +171,7 @@ const uint32_t      NOTIFICATION_DELAY_MS   = 3000;  // delay before firing one-
 const unsigned long SMOKE_STARTUP_IGNORE_MS = 30000; // suppress smoke alerts during MQ-2 warm-up
 
 const bool          AUTO_RESTORE_ON_SAFE    = true;     // auto-clear lockout when hazard stays safe
-const uint32_t      REARM_CLEAR_HOLD_MS     = 2000;     // 2 s continuous safe required to end episode
+const uint32_t      REARM_CLEAR_HOLD_MS     = 10000;    // 10 s continuous safe required to end episode (flame + smoke)
 const char          RESTORE_MODE[]          = "pre_trip_states";
 
 // --- Pins (array index 0..4 == room 1..5)
