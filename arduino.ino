@@ -247,6 +247,15 @@ uint32_t alertEpisodeId      = 0;
 bool     preTripSnapshotValid = false;
 bool     preTripLightState[ROOM_COUNT] = {false, false, false, false, false};
 
+// Synthetic hazard for POST /test-alert. Lets the phone app verify its
+// notification pipeline end-to-end without provoking a real sensor. When
+// active, updateAlerts() forces wouldHaveFlameAlert=true so the normal
+// episode FSM runs and increments alertEpisodeId, but the relay trip is
+// suppressed so lights / fireLockout stay untouched.
+bool     testAlertActive     = false;
+uint32_t testAlertStartMs    = 0;
+uint32_t testAlertDurationMs = 0;
+
 // Per-room stuck / noise tracking for the flame inputs. Populated in
 // readSensors() after calibration completes. The warnings each fire at
 // most once per boot so the Serial log stays grep-friendly.
@@ -855,6 +864,17 @@ void updateAlerts(uint32_t now) {
     if (SMOKE_SENSOR_ENABLED[i] && r.smokeAlert)    wouldHaveSmokeAlert = true;
   }
 
+  // /test-alert injection: force a fake flame hazard while the test window is
+  // open so the existing episode FSM runs unchanged. Auto-clears when expired.
+  if (testAlertActive) {
+    if ((now - testAlertStartMs) < testAlertDurationMs) {
+      wouldHaveFlameAlert = true;
+    } else {
+      testAlertActive = false;
+      Serial.println(F("[TEST-ALERT] window expired"));
+    }
+  }
+
   bool wouldHaveSensorAlert = wouldHaveFlameAlert || wouldHaveSmokeAlert;
   wouldAlert = wouldHaveSensorAlert;
 
@@ -885,7 +905,9 @@ void updateAlerts(uint32_t now) {
 
     if (!episodeActive && hazardActiveNow) {
       snapshotPreTripLights();
-      tripAllLightsForHazard();
+      // /test-alert is a notification dry-run: skip the physical trip so
+      // lights and fireLockout stay as the user left them.
+      if (!testAlertActive) tripAllLightsForHazard();
       episodeActive        = true;
       episodeStartedAt     = now;
       clearSinceMs         = 0;
@@ -897,9 +919,13 @@ void updateAlerts(uint32_t now) {
       Serial.print(F("[ALARM] start id="));
       Serial.print(alertEpisodeId);
       Serial.print(F(" reason="));
-      Serial.println(sensorReason);
-      Serial.print(F("[TRIP] lights off + lockout latched restoreMode="));
-      Serial.println(RESTORE_MODE);
+      Serial.print(sensorReason);
+      if (testAlertActive) Serial.println(F(" (test)"));
+      else                 Serial.println();
+      if (!testAlertActive) {
+        Serial.print(F("[TRIP] lights off + lockout latched restoreMode="));
+        Serial.println(RESTORE_MODE);
+      }
     }
 
     if (episodeActive && hazardActiveNow) {
@@ -1333,6 +1359,35 @@ void handleHttpClient() {
         }
         body += "]}";
         sendResponse(httpClient, 409, "application/json", body);
+      }
+    } else if (method == "POST" && path == "/test-alert") {
+      // Synthetic hazard to verify the phone notification pipeline without
+      // a real sensor. Latches a fake flame episode for `duration` ms
+      // (default 5000, clamped 1000..10000). Relays + lockout are NOT
+      // touched — see the testAlertActive suppression in updateAlerts().
+      if (COMMISSIONING_MODE) {
+        sendResponse(httpClient, 409, "application/json",
+                     "{\"error\":\"COMMISSIONING_MODE active — alarm machinery suppressed; "
+                     "set COMMISSIONING_MODE=false in arduino.ino to test notifications\"}");
+      } else {
+        uint32_t duration = 5000;
+        String durStr = queryParam(query, "duration");
+        if (durStr.length() > 0) {
+          long parsed = durStr.toInt();
+          if (parsed < 1000)  parsed = 1000;
+          if (parsed > 10000) parsed = 10000;
+          duration = (uint32_t)parsed;
+        }
+        testAlertActive     = true;
+        testAlertStartMs    = millis();
+        testAlertDurationMs = duration;
+        Serial.print(F("[TEST-ALERT] synthetic hazard for "));
+        Serial.print(duration);
+        Serial.println(F(" ms"));
+        String body = "{\"ok\":true,\"testAlert\":true,\"durationMs\":";
+        body += duration;
+        body += "}";
+        sendResponse(httpClient, 200, "application/json", body);
       }
     } else {
       sendResponse(httpClient, 404, "application/json", "{\"error\":\"not found\"}");
