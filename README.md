@@ -15,7 +15,7 @@ from new builds).
 | --- | --- | --- |
 | Flame sensors (digital DO) | 5 | D2..D6 |
 | MQ-2 smoke sensors (analog) | 5 | A0..A4 |
-| Relay-driven bulbs (220 V AC) | 5 | D7..D11 (active-LOW) |
+| Relay-driven bulbs (220 V AC) | 5 | D7..D11 (active-HIGH) |
 | Buzzer (legacy, no longer driven) | — | D12 left unconnected |
 
 The full schematic is in `.context/attachments/ogbcsK/ChatGPT Image May 25, 2026, 04_26_48 PM.png`.

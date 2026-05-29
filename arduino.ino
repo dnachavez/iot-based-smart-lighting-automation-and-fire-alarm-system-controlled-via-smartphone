@@ -68,7 +68,14 @@ const uint32_t WIFI_CONNECT_TIMEOUT_MS    = 10000;  // setup() gives up after th
 const uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;  // backoff between reconnect attempts
 const uint32_t HTTP_CLIENT_TIMEOUT_MS     = 2000;   // drop a slow/silent HTTP client after this
 
-const bool          RELAY_ACTIVE_LOW        = true;  // most 8-ch relay boards energize when IN pulled LOW
+// Relay drive polarity. true  = board energizes when IN is pulled LOW (typical
+// opto-isolated 8-ch boards). false = board energizes when IN is driven HIGH.
+// This build's board is active-HIGH: with the active-LOW assumption the relays
+// sat energized at idle (bulbs ON, red LEDs lit) and the flame "cut" command
+// actually held them ON. Quick field test: if at a clean boot — no flame, before
+// any app command — the bulbs are ON / relay LEDs are red, the board is the
+// opposite polarity from this flag, so flip it.
+const bool          RELAY_ACTIVE_LOW        = false; // active-HIGH board: IN HIGH energizes the relay
 
 // =============================================================
 // DEBUG / COMMISSIONING CONFIG
@@ -353,6 +360,14 @@ void setup() {
   } else {
     Serial.println(F("no (production safety behavior)"));
   }
+  // Relay polarity + the level the pins idle at, so a miswired-polarity board is
+  // obvious from the boot log instead of needing a multimeter on the IN pins.
+  Serial.print(F("[CFG] RELAY_ACTIVE_LOW="));
+  if (RELAY_ACTIVE_LOW) {
+    Serial.println(F("YES (active-LOW; idle drives pins HIGH = relays off)"));
+  } else {
+    Serial.println(F("no (active-HIGH; idle drives pins LOW = relays off)"));
+  }
   Serial.print(F("[CFG] USE_MANUAL_FLAME_LEVELS_DURING_COMMISSIONING="));
   Serial.println(USE_MANUAL_FLAME_LEVELS_DURING_COMMISSIONING ? F("YES") : F("no"));
   Serial.print(F("[CFG] AUTO_RESTORE_ON_SAFE="));
@@ -425,8 +440,10 @@ void setup() {
     }
 
     // Pre-load the output latch to the relay's INACTIVE level BEFORE switching
-    // the pin to OUTPUT. Otherwise the pin transitions through the default LOW
-    // state, which momentarily energizes an active-LOW relay at boot.
+    // the pin to OUTPUT, so the pin never drives the energize level even briefly
+    // at boot. INACTIVE is HIGH for an active-LOW board and LOW for an active-HIGH
+    // board (this build). On an active-LOW board this specifically avoids the
+    // pin passing through its default LOW state and momentarily clicking a relay.
     digitalWrite(RELAY_PINS[i], RELAY_ACTIVE_LOW ? HIGH : LOW);
     pinMode(RELAY_PINS[i], OUTPUT);
     rooms[i].lightOn           = false;
