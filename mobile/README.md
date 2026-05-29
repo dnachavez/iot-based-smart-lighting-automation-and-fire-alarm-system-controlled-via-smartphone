@@ -105,11 +105,12 @@ eas login                                                # one-time
 eas build --platform android --profile preview
 ```
 
-The signing keystore is committed locally at `credentials/release.keystore`
-(referenced by `credentials.json`, both gitignored). EAS uploads the project
-tarball to its builders, signs the resulting APK with that keystore, and
-gives you a download URL when done. Typical end-to-end time: **10–20 min**
-(queue + build).
+On the first build, EAS offers to generate and store an Android keystore on
+Expo's servers — answer **Yes**. It reuses that managed keystore for every
+later build, signs the resulting APK, and gives you a download URL when done.
+Typical end-to-end time: **10–20 min** (queue + build). Because the keystore is
+freshly generated, **uninstall any previously sideloaded build first** — Android
+won't install an APK with a different signing key over an existing install.
 
 When the build finishes, download the APK:
 
