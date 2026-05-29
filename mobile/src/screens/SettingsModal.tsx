@@ -54,7 +54,10 @@ export const SettingsModal: React.FC<Props> = ({ visible, onClose }) => {
     } else if (res.kind === 'timeout') {
       Alert.alert('Timed out', 'No response. Check IP and that the Arduino is on the same WiFi.');
     } else if (res.kind === 'network') {
-      Alert.alert('Network error', res.message);
+      Alert.alert(
+        'Network error',
+        `Couldn't reach the Arduino (${res.message}). Make sure this phone and the Arduino are on the same WiFi, and that you've installed the latest app build.`,
+      );
     } else {
       Alert.alert('HTTP error', `Status ${res.code}: ${res.body.slice(0, 200)}`);
     }
