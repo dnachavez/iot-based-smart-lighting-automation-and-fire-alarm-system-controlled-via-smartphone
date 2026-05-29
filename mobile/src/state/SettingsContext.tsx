@@ -55,24 +55,28 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     })();
   }, []);
 
-  const persist = useCallback(async (next: Settings) => {
-    setSettings(next);
-    try {
-      await AsyncStorage.setItem(
+  // Merge a partial change against the *latest* state via a functional update.
+  // Passing the patch (not a pre-merged object) means back-to-back setIp/setToken
+  // calls in one handler don't clobber each other with a stale snapshot.
+  const persist = useCallback((patch: Partial<Settings>) => {
+    setSettings((prev) => {
+      const next = { ...prev, ...patch };
+      AsyncStorage.setItem(
         STORAGE_KEY,
         JSON.stringify({ ip: next.ip, token: next.token }),
-      );
-    } catch {
-      // swallow — settings will revert to disk on next launch
-    }
+      ).catch(() => {
+        // swallow — settings will revert to disk on next launch
+      });
+      return next;
+    });
   }, []);
 
   const value = useMemo<SettingsContextValue>(
     () => ({
       ...settings,
       ready,
-      setIp: (ip) => persist({ ...settings, ip }),
-      setToken: (token) => persist({ ...settings, token }),
+      setIp: (ip) => persist({ ip }),
+      setToken: (token) => persist({ token }),
       setMuted: (muted) => setSettings((s) => ({ ...s, muted })),
     }),
     [settings, ready, persist],
